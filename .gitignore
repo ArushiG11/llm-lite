@@ -1,0 +1,49 @@
+# =========================
+# Python / virtualenv
+# =========================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv
+venv/
+ENV/
+
+# =========================
+# OS / Editor noise
+# =========================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# =========================
+# Data files (DO NOT COMMIT)
+# =========================
+data/wiki/dump/
+data/wiki/extracted/    
+data/processed/train.txt
+data/processed/valid.txt
+data/processed/train.bin
+data/processed/valid.bin
+
+# =========================
+# Trained models / artifacts
+# =========================
+models/
+*.npy
+*.pt
+*.pth
+*.ckpt
+
+# =========================
+# Logs / temporary files
+# =========================
+*.log
+*.tmp
+
+# =========================
+# Jupyter (if you use later)
+# =========================
+.ipynb_checkpoints/
