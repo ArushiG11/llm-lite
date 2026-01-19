@@ -21,12 +21,8 @@ Thumbs.db
 # =========================
 # Data files (DO NOT COMMIT)
 # =========================
-data/wiki/dump/
-data/wiki/extracted/    
-data/processed/train.txt
-data/processed/valid.txt
-data/processed/train.bin
-data/processed/valid.bin
+data/wiki/*   
+data/processed/*
 
 # =========================
 # Trained models / artifacts
