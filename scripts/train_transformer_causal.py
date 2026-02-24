@@ -1,51 +1,49 @@
 import math
+import pathlib
+import time
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tokenizers import Tokenizer
 
-# CPU-friendly
-# BATCH_SIZE = 16
-# BLOCK_SIZE = 128
-# EMBED_DIM = 128
-# NUM_HEADS = 4
-# NUM_LAYERS = 2
-# DROPOUT = 0.1
-
-# LEARNING_RATE = 3e-4
-# TRAIN_STEPS = 1200
-# EVAL_BATCHES = 50
-# MAX_TRAIN_TOKENS = 2_000_000
-
-# DEVICE = "cpu"
-
-# CPU-friendly but stronger than before
+# -------------------------
+# Config (CPU-friendly defaults)
+# -------------------------
 BATCH_SIZE = 8
 BLOCK_SIZE = 256
 
 EMBED_DIM = 192
-NUM_HEADS = 6       # must divide EMBED_DIM (192/6=32)
+NUM_HEADS = 6          # must divide EMBED_DIM
 NUM_LAYERS = 3
 DROPOUT = 0.1
 
 LEARNING_RATE = 3e-4
 TRAIN_STEPS = 12000
+EVAL_EVERY = 200
 EVAL_BATCHES = 30
-MAX_TRAIN_TOKENS = 10_000_000
 
+MAX_TRAIN_TOKENS = 10_000_000  # set None to use full
 DEVICE = "cpu"
 
+TRAIN_BIN = "data/processed/train.bin"
+VALID_BIN = "data/processed/valid.bin"
+TOK_PATH = "tokenizer/bpe_tokenizer.json"
+OUT_DIR = pathlib.Path("models/transformer")
 
+# -------------------------
+# Data
+# -------------------------
 def load_tokens(path):
     return np.fromfile(path, dtype=np.uint16)
 
-train_tokens = load_tokens("data/processed/train.bin")
-valid_tokens = load_tokens("data/processed/valid.bin")
-if len(train_tokens) > MAX_TRAIN_TOKENS:
+train_tokens = load_tokens(TRAIN_BIN)
+valid_tokens = load_tokens(VALID_BIN)
+
+if MAX_TRAIN_TOKENS is not None and len(train_tokens) > MAX_TRAIN_TOKENS:
     train_tokens = train_tokens[:MAX_TRAIN_TOKENS]
 
-tokenizer = Tokenizer.from_file("tokenizer/bpe_tokenizer.json")
+tokenizer = Tokenizer.from_file(TOK_PATH)
 VOCAB_SIZE = tokenizer.get_vocab_size()
 
 print("Train tokens:", len(train_tokens))
@@ -58,12 +56,15 @@ def get_batch(tokens_np):
     y = np.stack([tokens_np[i+1:i+BLOCK_SIZE+1] for i in ix])
     return torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long)
 
+# -------------------------
+# Model (GPT-style)
+# -------------------------
 class CausalSelfAttention(nn.Module):
     def __init__(self):
         super().__init__()
         assert EMBED_DIM % NUM_HEADS == 0
-        self.num_heads = NUM_HEADS
-        self.head_dim = EMBED_DIM // NUM_HEADS
+        self.nh = NUM_HEADS
+        self.hd = EMBED_DIM // NUM_HEADS
 
         self.qkv = nn.Linear(EMBED_DIM, 3 * EMBED_DIM, bias=False)
         self.proj = nn.Linear(EMBED_DIM, EMBED_DIM, bias=False)
@@ -79,11 +80,11 @@ class CausalSelfAttention(nn.Module):
         qkv = self.qkv(x)
         q, k, v = qkv.split(C, dim=2)
 
-        q = q.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        q = q.view(B, T, self.nh, self.hd).transpose(1, 2)  # (B, nh, T, hd)
+        k = k.view(B, T, self.nh, self.hd).transpose(1, 2)
+        v = v.view(B, T, self.nh, self.hd).transpose(1, 2)
 
-        att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        att = (q @ k.transpose(-2, -1)) / math.sqrt(self.hd)  # (B, nh, T, T)
         att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float("-inf"))
         att = F.softmax(att, dim=-1)
         att = self.drop(att)
@@ -142,30 +143,16 @@ class GPTMini(nn.Module):
             loss = F.cross_entropy(logits.view(-1, VOCAB_SIZE), targets.view(-1))
         return logits, loss
 
-    # @torch.no_grad()
-    # def generate(self, idx, max_new_tokens=200, seed=42, temperature=1.0):
-    #     rng = np.random.default_rng(seed)
-    #     for _ in range(max_new_tokens):
-    #         idx_cond = idx[:, -BLOCK_SIZE:]
-    #         logits, _ = self(idx_cond)
-    #         logits = logits[:, -1, :] / max(temperature, 1e-6)
-    #         probs = F.softmax(logits, dim=-1).cpu().numpy()[0]
-    #         next_id = int(rng.choice(VOCAB_SIZE, p=probs))
-    #         idx = torch.cat([idx, torch.tensor([[next_id]], dtype=torch.long)], dim=1)
-    #     return idx
-
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens=200, seed=42, temperature=1.0, top_k=50):
+    def generate(self, idx, max_new_tokens=200, seed=42, temperature=0.9, top_k=50):
         rng = np.random.default_rng(seed)
         for _ in range(max_new_tokens):
             idx_cond = idx[:, -BLOCK_SIZE:]
             logits, _ = self(idx_cond)
+            logits = logits[:, -1, :] / max(temperature, 1e-6)
+            logits = logits.squeeze(0)
 
-            logits = logits[:, -1, :] / max(temperature, 1e-6)  # (1, V)
-            logits = logits.squeeze(0)  # (V,)
-
-            # top-k filter
-            if top_k is not None and top_k > 0:
+            if top_k and top_k > 0:
                 v, ix = torch.topk(logits, k=top_k)
                 probs = F.softmax(v, dim=-1).cpu().numpy()
                 next_id = int(rng.choice(ix.cpu().numpy(), p=probs))
@@ -176,10 +163,11 @@ class GPTMini(nn.Module):
             idx = torch.cat([idx, torch.tensor([[next_id]], dtype=torch.long)], dim=1)
         return idx
 
-
+# -------------------------
+# Train + Eval
+# -------------------------
 model = GPTMini().to(DEVICE)
 opt = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
-
 
 def estimate_val():
     model.eval()
@@ -194,7 +182,10 @@ def estimate_val():
     avg = sum(losses) / len(losses)
     return avg, math.exp(avg)
 
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
 print("\nTraining...")
+t0 = time.time()
 for step in range(1, TRAIN_STEPS + 1):
     xb, yb = get_batch(train_tokens)
     xb, yb = xb.to(DEVICE), yb.to(DEVICE)
@@ -202,14 +193,33 @@ for step in range(1, TRAIN_STEPS + 1):
     _, loss = model(xb, yb)
     opt.zero_grad()
     loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     opt.step()
 
-    if step % 200 == 0:
+    if step % EVAL_EVERY == 0:
         vloss, vppl = estimate_val()
-        print(f"step {step:4d} | train_loss {loss.item():.4f} | val_loss {vloss:.4f} | val_ppl {vppl:.2f}")
+        dt = time.time() - t0
+        print(f"step {step:5d} | train_loss {loss.item():.4f} | val_loss {vloss:.4f} | val_ppl {vppl:.2f} | {dt:.0f}s")
 
-print("\nDone. Sample:\n")
+# Save checkpoint
+ckpt = {
+    "state_dict": model.state_dict(),
+    "config": {
+        "BATCH_SIZE": BATCH_SIZE,
+        "BLOCK_SIZE": BLOCK_SIZE,
+        "EMBED_DIM": EMBED_DIM,
+        "NUM_HEADS": NUM_HEADS,
+        "NUM_LAYERS": NUM_LAYERS,
+        "DROPOUT": DROPOUT,
+        "VOCAB_SIZE": VOCAB_SIZE,
+    }
+}
+torch.save(ckpt, OUT_DIR / "ckpt.pt")
+print("\nSaved:", OUT_DIR / "ckpt.pt")
+
+print("\n--- Transformer sample ---\n")
 bos = tokenizer.token_to_id("<bos>")
 start_id = bos if bos is not None else 0
-out = model.generate(torch.tensor([[start_id]], dtype=torch.long), max_new_tokens=200, seed=42, temperature=1.0)[0].tolist()
+start = torch.tensor([[start_id]], dtype=torch.long)
+out = model.generate(start, max_new_tokens=250, seed=42, temperature=0.9, top_k=50)[0].tolist()
 print(tokenizer.decode(out))

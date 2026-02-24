@@ -1,5 +1,10 @@
+"""
+TransformerEncoder-based LM (bidirectional). For autoregressive text generation
+use scripts/train_transformer_causal.py instead.
+"""
 import math
 import pathlib
+import time
 import numpy as np
 import torch
 import torch.nn as nn
@@ -16,11 +21,21 @@ BLOCK_SIZE = 128      # context length
 EMBED_DIM = 128
 NUM_HEADS = 4
 NUM_LAYERS = 2
+DROPOUT = 0.1
 LEARNING_RATE = 3e-4
+TRAIN_STEPS = 12000
+EVAL_EVERY = 200
+EVAL_BATCHES = 30
+
 MAX_TRAIN_TOKENS = 2_000_000
+DEVICE = "cpu"
+
 EPOCHS = 3
 
-
+TRAIN_BIN = "data/processed/train.bin"
+VALID_BIN = "data/processed/valid.bin"
+TOK_PATH = "tokenizer/bpe_tokenizer.json"
+OUT_DIR = pathlib.Path("models/transformer")
 # -----------------------
 # Load data
 # -----------------------
@@ -28,13 +43,13 @@ def load_tokens(path):
     return np.fromfile(path, dtype=np.uint16)
 
 
-train_tokens = load_tokens("data/processed/train.bin")
-valid_tokens = load_tokens("data/processed/valid.bin")
+train_tokens = load_tokens(TRAIN_BIN)
+valid_tokens = load_tokens(VALID_BIN)
 
-if len(train_tokens) > MAX_TRAIN_TOKENS:
+if MAX_TRAIN_TOKENS is not None and len(train_tokens) > MAX_TRAIN_TOKENS:
     train_tokens = train_tokens[:MAX_TRAIN_TOKENS]
 
-tokenizer = Tokenizer.from_file("tokenizer/bpe_tokenizer.json")
+tokenizer = Tokenizer.from_file(TOK_PATH)
 VOCAB_SIZE = tokenizer.get_vocab_size()
 
 print("Train tokens:", len(train_tokens))

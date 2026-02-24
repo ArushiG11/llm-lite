@@ -7,7 +7,11 @@ import mwxml
 # Import mwparserfromhell for cleaning Wikipedia markup syntax
 import mwparserfromhell
 # Import tqdm for showing progress bars during processing
-from tqdm import tqdm
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable, **kwargs):
+        return iterable
 
 # Path to the compressed Wikipedia dump file (downloaded by download_wiki_dump.py)
 DUMP_PATH = pathlib.Path("data/wiki/dump/simplewiki-latest-pages-articles.xml.bz2")
