@@ -59,3 +59,32 @@ Two options; both produce `data/processed/train.bin`, `valid.bin`, and `tokenize
 - **Evaluation**: Track perplexity and a few fixed prompts; add a simple downstream task (e.g. next-sentence or classification) if you want.
 
 See `ROADMAP.md` for a concrete ordered list of next steps.
+
+---
+
+## Phase 2: Backend (Inference API)
+
+Run the trained transformer as a **service** so a user or UI can call it.
+
+- **API:** FastAPI app in `api/app/` — load checkpoint, expose `POST /v1/generate` and `POST /v1/stream`.
+- **Run:** From repo root, `uvicorn api.app.main:app --port 8000` (after training and `pip install -r api/requirements.txt`).
+- **Docs:** See **[api/README.md](api/README.md)** for prerequisites, env vars, endpoints, and example `curl` calls.
+
+---
+
+## Phase 3: UI
+
+A **React + TypeScript** web UI (Vite) to prompt the model and stream or one-shot generate.
+
+- **Stack:** React 18, TypeScript, Vite. Lives in `ui/`.
+- **Dev:** From repo root, run the API on port 8000, then in another terminal:
+  ```bash
+  cd ui && npm install && npm run dev
+  ```
+  Open the URL Vite prints (e.g. http://localhost:5173); the dev server proxies `/healthz` and `/v1/*` to the API.
+- **Production:** Build and serve from the API:
+  ```bash
+  cd ui && npm install && npm run build
+  ```
+  Then start the API and open **http://127.0.0.1:8000/ui**.
+- **Features:** Prompt box, “Stream response” toggle, Generate button, optional generation settings (max tokens, temperature, top-k, top-p, repetition penalty), Copy output, and a status indicator for model loaded.

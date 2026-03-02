@@ -5,3 +5,6 @@ mwparserfromhell
 tqdm
 tokenizers
 numpy
+
+# Optional: for scripts/evaluate_models.py graphs
+matplotlib

@@ -1,4 +1,5 @@
 import math
+import argparse
 import pathlib
 import time
 import numpy as np
@@ -30,6 +31,14 @@ TRAIN_BIN = "data/processed/train.bin"
 VALID_BIN = "data/processed/valid.bin"
 TOK_PATH = "tokenizer/bpe_tokenizer.json"
 OUT_DIR = pathlib.Path("models/transformer")
+
+# Optional: override steps from CLI (e.g. --max-steps 100 for a quick checkpoint)
+ap = argparse.ArgumentParser()
+ap.add_argument("--max-steps", type=int, default=None, help="Override TRAIN_STEPS (default: 12000)")
+_cli = ap.parse_args()
+if _cli.max_steps is not None:
+    TRAIN_STEPS = _cli.max_steps
+    print(f"(Using --max-steps {TRAIN_STEPS})")
 
 # -------------------------
 # Data
@@ -212,7 +221,8 @@ ckpt = {
         "NUM_LAYERS": NUM_LAYERS,
         "DROPOUT": DROPOUT,
         "VOCAB_SIZE": VOCAB_SIZE,
-    }
+    },
+    "tokenizer_path": str(TOK_PATH),
 }
 torch.save(ckpt, OUT_DIR / "ckpt.pt")
 print("\nSaved:", OUT_DIR / "ckpt.pt")

@@ -43,3 +43,10 @@ models/
 # Jupyter (if you use later)
 # =========================
 .ipynb_checkpoints/
+
+# =========================
+# Node / frontend (ui/)
+# =========================
+ui/node_modules/
+ui/dist/
+ui/*.local

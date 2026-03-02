@@ -1,0 +1,302 @@
+#!/usr/bin/env python3
+"""
+Unified evaluation: Bigram vs Trigram vs Transformer.
+
+Computes validation perplexity for each model (where available) and plots a bar chart.
+Run from repo root: python scripts/evaluate_models.py [--valid-subset N] [--no-plot]
+"""
+
+import argparse
+import math
+import os
+import pickle
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from tokenizers import Tokenizer
+
+# Paths (from repo root)
+REPO_ROOT = Path(__file__).resolve().parent.parent
+VALID_BIN = REPO_ROOT / "data/processed/valid.bin"
+TOK_PATH = REPO_ROOT / "tokenizer/bpe_tokenizer.json"
+BIGRAM_DENSE_COUNTS = REPO_ROOT / "models/bigram_counts.npy"
+BIGRAM_DENSE_UNIGRAM = REPO_ROOT / "models/bigram_unigram.npy"
+BIGRAM_SPARSE_PKL = REPO_ROOT / "models/bigram_sparse.pkl"
+TRIGRAM_PKL = REPO_ROOT / "models/trigram.pkl"
+TRANSFORMER_CKPT = REPO_ROOT / "models/transformer/ckpt.pt"
+
+ALPHA_BIGRAM = 0.1
+
+
+def load_valid_tokens(max_tokens=None):
+    if not VALID_BIN.is_file():
+        raise FileNotFoundError(f"Validation data not found: {VALID_BIN}. Run data prep first.")
+    tokens = np.fromfile(VALID_BIN, dtype=np.uint16)
+    if max_tokens is not None and len(tokens) > max_tokens:
+        tokens = tokens[:max_tokens]
+    return tokens
+
+
+# ---------- Bigram (dense: train_bigram.py) ----------
+def eval_bigram_dense(valid_tokens, V):
+    if not BIGRAM_DENSE_COUNTS.is_file() or not BIGRAM_DENSE_UNIGRAM.is_file():
+        return None
+    flat_counts = np.load(BIGRAM_DENSE_COUNTS)
+    unigram = np.load(BIGRAM_DENSE_UNIGRAM)
+    prev = valid_tokens[:-1].astype(np.uint64)
+    nxt = valid_tokens[1:].astype(np.uint64)
+    N = len(nxt)
+    idx = prev * V + nxt
+    counts = flat_counts[idx]
+    unigram_prev = unigram[prev]
+    denom = unigram_prev + ALPHA_BIGRAM * V
+    probs = np.clip((counts.astype(np.float64) + ALPHA_BIGRAM) / denom, 1e-12, 1.0)
+    avg_nll = -np.log(probs).sum() / max(N, 1)
+    return math.exp(avg_nll), avg_nll
+
+
+# ---------- Bigram (sparse: train_bigram_sparse.py) ----------
+def eval_bigram_sparse(valid_tokens, V):
+    if not BIGRAM_SPARSE_PKL.is_file():
+        return None
+    with open(BIGRAM_SPARSE_PKL, "rb") as f:
+        data = pickle.load(f)
+    bigram = data["bigram"]
+    prev_count = data["prev_count"]
+    alpha = data.get("alpha", ALPHA_BIGRAM)
+    nll = 0.0
+    n = 0
+    for a, b in zip(valid_tokens[:-1], valid_tokens[1:]):
+        a, b = int(a), int(b)
+        p = (bigram[(a, b)] + alpha) / (prev_count[a] + alpha * V)
+        p = max(p, 1e-12)
+        nll += -math.log(p)
+        n += 1
+    avg_nll = nll / max(n, 1)
+    return math.exp(avg_nll), avg_nll
+
+
+# ---------- Trigram (train_trigram.py) ----------
+def eval_trigram(valid_tokens, V):
+    if not TRIGRAM_PKL.is_file():
+        return None
+    with open(TRIGRAM_PKL, "rb") as f:
+        data = pickle.load(f)
+    unigram = data["unigram"]
+    bigram = data["bigram"]
+    bigram_ctx = data["bigram_ctx"]
+    trigram = data["trigram"]
+    trigram_ctx = data["trigram_ctx"]
+    total = data["total"]
+    alpha = data.get("alpha", 0.1)
+    lambdas = data.get("lambdas", (0.55, 0.30, 0.15))
+    l3, l2, l1 = lambdas
+
+    def p1(w):
+        return (unigram.get(w, 0) + alpha) / (total + alpha * V)
+
+    def p2(prev, w):
+        return (bigram.get((prev, w), 0) + alpha) / (bigram_ctx.get(prev, 0) + alpha * V)
+
+    def p3(prev2, prev1, w):
+        return (trigram.get((prev2, prev1, w), 0) + alpha) / (trigram_ctx.get((prev2, prev1), 0) + alpha * V)
+
+    nll = 0.0
+    n = 0
+    for i in range(2, len(valid_tokens)):
+        a, b, c = int(valid_tokens[i - 2]), int(valid_tokens[i - 1]), int(valid_tokens[i])
+        p = l3 * p3(a, b, c) + l2 * p2(b, c) + l1 * p1(c)
+        p = max(p, 1e-12)
+        nll += -math.log(p)
+        n += 1
+    avg_nll = nll / max(n, 1)
+    return math.exp(avg_nll), avg_nll
+
+
+# ---------- Transformer (train_transformer_causal.py) ----------
+def eval_transformer(valid_tokens, device="cpu"):
+    if not TRANSFORMER_CKPT.is_file():
+        return None
+    ckpt = torch.load(TRANSFORMER_CKPT, map_location=device)
+    cfg = ckpt["config"]
+    BLOCK_SIZE = cfg["BLOCK_SIZE"]
+    VOCAB_SIZE = cfg["VOCAB_SIZE"]
+
+    # Minimal model copy (must match train_transformer_causal / generate_transformer)
+    from torch import nn
+
+    class CausalSelfAttention(nn.Module):
+        def __init__(self, embed_dim, num_heads, block_size, dropout):
+            super().__init__()
+            self.nh = num_heads
+            self.hd = embed_dim // num_heads
+            self.qkv = nn.Linear(embed_dim, 3 * embed_dim, bias=False)
+            self.proj = nn.Linear(embed_dim, embed_dim, bias=False)
+            self.drop = nn.Dropout(dropout)
+            self.register_buffer("mask", torch.tril(torch.ones(block_size, block_size)).view(1, 1, block_size, block_size))
+
+        def forward(self, x):
+            B, T, C = x.shape
+            qkv = self.qkv(x)
+            q, k, v = qkv.split(C, dim=2)
+            q = q.view(B, T, self.nh, self.hd).transpose(1, 2)
+            k = k.view(B, T, self.nh, self.hd).transpose(1, 2)
+            v = v.view(B, T, self.nh, self.hd).transpose(1, 2)
+            att = (q @ k.transpose(-2, -1)) / math.sqrt(self.hd)
+            att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float("-inf"))
+            att = F.softmax(att, dim=-1)
+            att = self.drop(att)
+            out = att @ v
+            out = out.transpose(1, 2).contiguous().view(B, T, C)
+            return self.drop(self.proj(out))
+
+    class MLP(nn.Module):
+        def __init__(self, embed_dim, dropout):
+            super().__init__()
+            self.fc1 = nn.Linear(embed_dim, 4 * embed_dim)
+            self.fc2 = nn.Linear(4 * embed_dim, embed_dim)
+            self.drop = nn.Dropout(dropout)
+        def forward(self, x):
+            return self.drop(self.fc2(F.gelu(self.fc1(x))))
+
+    class Block(nn.Module):
+        def __init__(self, embed_dim, num_heads, block_size, dropout):
+            super().__init__()
+            self.ln1 = nn.LayerNorm(embed_dim)
+            self.attn = CausalSelfAttention(embed_dim, num_heads, block_size, dropout)
+            self.ln2 = nn.LayerNorm(embed_dim)
+            self.mlp = MLP(embed_dim, dropout)
+        def forward(self, x):
+            x = x + self.attn(self.ln1(x))
+            return x + self.mlp(self.ln2(x))
+
+    class GPTMini(nn.Module):
+        def __init__(self, vocab_size, embed_dim, num_heads, num_layers, block_size, dropout):
+            super().__init__()
+            self.block_size = block_size
+            self.tok = nn.Embedding(vocab_size, embed_dim)
+            self.pos = nn.Embedding(block_size, embed_dim)
+            self.drop = nn.Dropout(dropout)
+            self.blocks = nn.ModuleList([Block(embed_dim, num_heads, block_size, dropout) for _ in range(num_layers)])
+            self.ln_f = nn.LayerNorm(embed_dim)
+            self.head = nn.Linear(embed_dim, vocab_size, bias=False)
+        def forward(self, idx):
+            B, T = idx.shape
+            pos = torch.arange(T, device=idx.device)
+            x = self.tok(idx) + self.pos(pos)
+            x = self.drop(x)
+            for blk in self.blocks:
+                x = blk(x)
+            return self.head(self.ln_f(x))
+
+    model = GPTMini(
+        vocab_size=VOCAB_SIZE,
+        embed_dim=cfg["EMBED_DIM"],
+        num_heads=cfg["NUM_HEADS"],
+        num_layers=cfg["NUM_LAYERS"],
+        block_size=BLOCK_SIZE,
+        dropout=0.0,
+    ).to(device)
+    model.load_state_dict(ckpt["state_dict"])
+    model.eval()
+
+    losses = []
+    with torch.no_grad():
+        for start in range(0, len(valid_tokens) - BLOCK_SIZE - 1, BLOCK_SIZE):
+            x = torch.tensor(valid_tokens[start : start + BLOCK_SIZE], dtype=torch.long, device=device).unsqueeze(0)
+            y = torch.tensor(valid_tokens[start + 1 : start + BLOCK_SIZE + 1], dtype=torch.long, device=device).unsqueeze(0)
+            logits = model(x)
+            loss = F.cross_entropy(logits.view(-1, VOCAB_SIZE), y.view(-1))
+            losses.append(loss.item())
+    if not losses:
+        return None
+    avg_nll = sum(losses) / len(losses)
+    return math.exp(avg_nll), avg_nll
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Evaluate bigram, trigram, transformer (perplexity)")
+    ap.add_argument("--valid-subset", type=int, default=None, help="Use first N validation tokens (default: all)")
+    ap.add_argument("--no-plot", action="store_true", help="Skip saving the bar chart")
+    ap.add_argument("--out", default=None, help="Output image path (default: models/evaluation.png)")
+    args = ap.parse_args()
+
+    print("Loading validation tokens...")
+    valid_tokens = load_valid_tokens(max_tokens=args.valid_subset)
+    tokenizer = Tokenizer.from_file(str(TOK_PATH))
+    V = tokenizer.get_vocab_size()
+    print(f"Valid tokens: {len(valid_tokens):,}, vocab size: {V}\n")
+
+    results = {}
+
+    # Bigram dense
+    out = eval_bigram_dense(valid_tokens, V)
+    if out is not None:
+        ppl, nll = out
+        results["Bigram (dense)"] = ppl
+        print(f"Bigram (dense)     | perplexity: {ppl:.2f} | avg NLL: {nll:.4f}")
+    else:
+        print("Bigram (dense)     | (no model: run train_bigram.py)")
+
+    # Bigram sparse
+    out = eval_bigram_sparse(valid_tokens, V)
+    if out is not None:
+        ppl, nll = out
+        results["Bigram (sparse)"] = ppl
+        print(f"Bigram (sparse)    | perplexity: {ppl:.2f} | avg NLL: {nll:.4f}")
+    else:
+        print("Bigram (sparse)    | (no model: run train_bigram_sparse.py)")
+
+    # Trigram
+    out = eval_trigram(valid_tokens, V)
+    if out is not None:
+        ppl, nll = out
+        results["Trigram"] = ppl
+        print(f"Trigram            | perplexity: {ppl:.2f} | avg NLL: {nll:.4f}")
+    else:
+        print("Trigram            | (no model: run train_trigram.py)")
+
+    # Transformer
+    out = eval_transformer(valid_tokens)
+    if out is not None:
+        ppl, nll = out
+        results["Transformer"] = ppl
+        print(f"Transformer        | perplexity: {ppl:.2f} | avg NLL: {nll:.4f}")
+    else:
+        print("Transformer        | (no model: run train_transformer_causal.py)")
+
+    if not results:
+        print("\nNo models found. Train at least one model (bigram, trigram, or transformer).")
+        return
+
+    # Plot
+    if not args.no_plot:
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except ImportError:
+            print("\n(Install matplotlib for graphs: pip install matplotlib)")
+        else:
+            names = list(results.keys())
+            values = list(results.values())
+            colors = ["#2ecc71", "#3498db", "#9b59b6", "#e74c3c"][: len(names)]
+            fig, ax = plt.subplots(figsize=(8, 5))
+            bars = ax.bar(names, values, color=colors, edgecolor="black", linewidth=0.8)
+            ax.set_ylabel("Perplexity (lower is better)", fontsize=12)
+            ax.set_title("Validation perplexity: Bigram vs Trigram vs Transformer", fontsize=14)
+            ax.set_ylim(0, max(values) * 1.15)
+            for bar, val in zip(bars, values):
+                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 2, f"{val:.1f}", ha="center", fontsize=11)
+            plt.tight_layout()
+            out_path = Path(args.out) if args.out else REPO_ROOT / "models/evaluation.png"
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            plt.savefig(out_path, dpi=120)
+            plt.close()
+            print(f"\nSaved plot: {out_path}")
+
+
+if __name__ == "__main__":
+    main()

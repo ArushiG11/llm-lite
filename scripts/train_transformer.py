@@ -152,3 +152,20 @@ def evaluate(tokens):
 
 ppl = evaluate(valid_tokens[:100_000])
 print("Validation perplexity:", ppl)
+
+ckpt = {
+    "state_dict": model.state_dict(),
+    "model_type": "gpt-mini",
+    "config": {
+        "BLOCK_SIZE": BLOCK_SIZE,
+        "EMBED_DIM": EMBED_DIM,
+        "NUM_HEADS": NUM_HEADS,
+        "NUM_LAYERS": NUM_LAYERS,
+        "DROPOUT": DROPOUT,
+        "VOCAB_SIZE": VOCAB_SIZE,
+    },
+    "tokenizer_path": TOK_PATH,
+}
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+torch.save(ckpt, OUT_DIR / "ckpt.pt")
+print("Saved:", OUT_DIR / "ckpt.pt")
