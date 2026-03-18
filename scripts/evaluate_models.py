@@ -10,6 +10,7 @@ import argparse
 import math
 import os
 import pickle
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -19,6 +20,10 @@ from tokenizers import Tokenizer
 
 # Paths (from repo root)
 REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+from model_causal import GPTMini
+
 VALID_BIN = REPO_ROOT / "data/processed/valid.bin"
 TOK_PATH = REPO_ROOT / "tokenizer/bpe_tokenizer.json"
 BIGRAM_DENSE_COUNTS = REPO_ROOT / "models/bigram_counts.npy"
@@ -124,81 +129,7 @@ def eval_transformer(valid_tokens, device="cpu"):
     BLOCK_SIZE = cfg["BLOCK_SIZE"]
     VOCAB_SIZE = cfg["VOCAB_SIZE"]
 
-    # Minimal model copy (must match train_transformer_causal / generate_transformer)
-    from torch import nn
-
-    class CausalSelfAttention(nn.Module):
-        def __init__(self, embed_dim, num_heads, block_size, dropout):
-            super().__init__()
-            self.nh = num_heads
-            self.hd = embed_dim // num_heads
-            self.qkv = nn.Linear(embed_dim, 3 * embed_dim, bias=False)
-            self.proj = nn.Linear(embed_dim, embed_dim, bias=False)
-            self.drop = nn.Dropout(dropout)
-            self.register_buffer("mask", torch.tril(torch.ones(block_size, block_size)).view(1, 1, block_size, block_size))
-
-        def forward(self, x):
-            B, T, C = x.shape
-            qkv = self.qkv(x)
-            q, k, v = qkv.split(C, dim=2)
-            q = q.view(B, T, self.nh, self.hd).transpose(1, 2)
-            k = k.view(B, T, self.nh, self.hd).transpose(1, 2)
-            v = v.view(B, T, self.nh, self.hd).transpose(1, 2)
-            att = (q @ k.transpose(-2, -1)) / math.sqrt(self.hd)
-            att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float("-inf"))
-            att = F.softmax(att, dim=-1)
-            att = self.drop(att)
-            out = att @ v
-            out = out.transpose(1, 2).contiguous().view(B, T, C)
-            return self.drop(self.proj(out))
-
-    class MLP(nn.Module):
-        def __init__(self, embed_dim, dropout):
-            super().__init__()
-            self.fc1 = nn.Linear(embed_dim, 4 * embed_dim)
-            self.fc2 = nn.Linear(4 * embed_dim, embed_dim)
-            self.drop = nn.Dropout(dropout)
-        def forward(self, x):
-            return self.drop(self.fc2(F.gelu(self.fc1(x))))
-
-    class Block(nn.Module):
-        def __init__(self, embed_dim, num_heads, block_size, dropout):
-            super().__init__()
-            self.ln1 = nn.LayerNorm(embed_dim)
-            self.attn = CausalSelfAttention(embed_dim, num_heads, block_size, dropout)
-            self.ln2 = nn.LayerNorm(embed_dim)
-            self.mlp = MLP(embed_dim, dropout)
-        def forward(self, x):
-            x = x + self.attn(self.ln1(x))
-            return x + self.mlp(self.ln2(x))
-
-    class GPTMini(nn.Module):
-        def __init__(self, vocab_size, embed_dim, num_heads, num_layers, block_size, dropout):
-            super().__init__()
-            self.block_size = block_size
-            self.tok = nn.Embedding(vocab_size, embed_dim)
-            self.pos = nn.Embedding(block_size, embed_dim)
-            self.drop = nn.Dropout(dropout)
-            self.blocks = nn.ModuleList([Block(embed_dim, num_heads, block_size, dropout) for _ in range(num_layers)])
-            self.ln_f = nn.LayerNorm(embed_dim)
-            self.head = nn.Linear(embed_dim, vocab_size, bias=False)
-        def forward(self, idx):
-            B, T = idx.shape
-            pos = torch.arange(T, device=idx.device)
-            x = self.tok(idx) + self.pos(pos)
-            x = self.drop(x)
-            for blk in self.blocks:
-                x = blk(x)
-            return self.head(self.ln_f(x))
-
-    model = GPTMini(
-        vocab_size=VOCAB_SIZE,
-        embed_dim=cfg["EMBED_DIM"],
-        num_heads=cfg["NUM_HEADS"],
-        num_layers=cfg["NUM_LAYERS"],
-        block_size=BLOCK_SIZE,
-        dropout=0.0,
-    ).to(device)
+    model = GPTMini.from_config(cfg, dropout_inference=0.0).to(device)
     model.load_state_dict(ckpt["state_dict"])
     model.eval()
 
@@ -207,7 +138,7 @@ def eval_transformer(valid_tokens, device="cpu"):
         for start in range(0, len(valid_tokens) - BLOCK_SIZE - 1, BLOCK_SIZE):
             x = torch.tensor(valid_tokens[start : start + BLOCK_SIZE], dtype=torch.long, device=device).unsqueeze(0)
             y = torch.tensor(valid_tokens[start + 1 : start + BLOCK_SIZE + 1], dtype=torch.long, device=device).unsqueeze(0)
-            logits = model(x)
+            logits, _ = model(x, targets=y)
             loss = F.cross_entropy(logits.view(-1, VOCAB_SIZE), y.view(-1))
             losses.append(loss.item())
     if not losses:

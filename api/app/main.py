@@ -9,7 +9,16 @@ from fastapi.staticfiles import StaticFiles
 from .schemas import GenerateRequest, GenerateResponse
 from .model import InferenceEngine
 
-CKPT_PATH = os.getenv("LLMLITE_CKPT", "models/transformer/ckpt.pt")
+def _default_ckpt():
+    base = Path(os.getenv("LLMLITE_CKPT", "models/transformer/ckpt.pt"))
+    if not os.getenv("LLMLITE_CKPT"):
+        best = base.parent / "ckpt_best.pt"
+        if best.is_file():
+            return str(best)
+    return str(base)
+
+
+CKPT_PATH = _default_ckpt()
 UI_DIST = Path(__file__).resolve().parent.parent.parent / "ui" / "dist"
 
 app = FastAPI(

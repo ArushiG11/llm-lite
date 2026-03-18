@@ -28,6 +28,33 @@ python scripts/train_transformer.py     # small encoder (CPU-friendly)
 python scripts/train_transformer_causal.py   # causal GPT-style
 ```
 
+### Lower perplexity & better generation
+
+To get **lower validation perplexity** and **more coherent samples**:
+
+1. **Train longer and on full data** (defaults are tuned for this now):
+   ```bash
+   python scripts/train_transformer_causal.py
+   ```
+   Defaults: 25k steps, batch 16, 4 layers, weight decay 0.1, warmup 1k steps, **all training tokens** (no cap). Use `--max-train-tokens 5000000` to cap data for a quicker run.
+
+2. **Optional: bigger model** (if you have GPU/memory):
+   ```bash
+   python scripts/train_transformer_causal.py --embed-dim 256 --num-layers 6 --batch-size 32 --max-steps 30000
+   ```
+
+3. **Resume** if training was interrupted:
+   ```bash
+   python scripts/train_transformer_causal.py --resume
+   ```
+
+4. **Generation quality**: The API uses **ckpt_best.pt** (best validation loss) when present. For less random, more coherent text use **lower temperature** (e.g. 0.7–0.8), **top_k 30–50**, and **repetition_penalty 1.1–1.2** in the UI or API.
+
+5. **Check perplexity** after training:
+   ```bash
+   python scripts/evaluate_models.py
+   ```
+
 Generated artifacts: `data/processed/*.bin`, `tokenizer/bpe_tokenizer.json`, `models/*.npy`, `models/*.pkl`.
 
 ## Data preparation (splitting and tokenizing)

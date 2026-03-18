@@ -1,235 +1,203 @@
-import math
+"""
+Train GPT-style causal transformer on tokenized .bin data.
+Uses shared model from model_causal; supports LR warmup+cosine, checkpointing, resume.
+Run from repo root: python scripts/train_transformer_causal.py [options]
+"""
 import argparse
+import math
 import pathlib
+import sys
 import time
+
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from tokenizers import Tokenizer
 
+# Import shared model from repo root
+_REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from model_causal import GPTMini, get_default_config
+
 # -------------------------
-# Config (CPU-friendly defaults)
+# Paths
 # -------------------------
-BATCH_SIZE = 8
-BLOCK_SIZE = 256
-
-EMBED_DIM = 192
-NUM_HEADS = 6          # must divide EMBED_DIM
-NUM_LAYERS = 3
-DROPOUT = 0.1
-
-LEARNING_RATE = 3e-4
-TRAIN_STEPS = 12000
-EVAL_EVERY = 200
-EVAL_BATCHES = 30
-
-MAX_TRAIN_TOKENS = 10_000_000  # set None to use full
-DEVICE = "cpu"
-
 TRAIN_BIN = "data/processed/train.bin"
 VALID_BIN = "data/processed/valid.bin"
 TOK_PATH = "tokenizer/bpe_tokenizer.json"
 OUT_DIR = pathlib.Path("models/transformer")
 
-# Optional: override steps from CLI (e.g. --max-steps 100 for a quick checkpoint)
-ap = argparse.ArgumentParser()
-ap.add_argument("--max-steps", type=int, default=None, help="Override TRAIN_STEPS (default: 12000)")
-_cli = ap.parse_args()
-if _cli.max_steps is not None:
-    TRAIN_STEPS = _cli.max_steps
-    print(f"(Using --max-steps {TRAIN_STEPS})")
+EVAL_EVERY = 200
+EVAL_BATCHES = 30
 
-# -------------------------
-# Data
-# -------------------------
+
 def load_tokens(path):
     return np.fromfile(path, dtype=np.uint16)
 
-train_tokens = load_tokens(TRAIN_BIN)
-valid_tokens = load_tokens(VALID_BIN)
 
-if MAX_TRAIN_TOKENS is not None and len(train_tokens) > MAX_TRAIN_TOKENS:
-    train_tokens = train_tokens[:MAX_TRAIN_TOKENS]
-
-tokenizer = Tokenizer.from_file(TOK_PATH)
-VOCAB_SIZE = tokenizer.get_vocab_size()
-
-print("Train tokens:", len(train_tokens))
-print("Valid tokens:", len(valid_tokens))
-print("Vocab size:", VOCAB_SIZE)
-
-def get_batch(tokens_np):
-    ix = np.random.randint(0, len(tokens_np) - BLOCK_SIZE - 1, BATCH_SIZE)
-    x = np.stack([tokens_np[i:i+BLOCK_SIZE] for i in ix])
-    y = np.stack([tokens_np[i+1:i+BLOCK_SIZE+1] for i in ix])
+def get_batch(tokens_np, block_size, batch_size):
+    ix = np.random.randint(0, len(tokens_np) - block_size - 1, batch_size)
+    x = np.stack([tokens_np[i : i + block_size] for i in ix])
+    y = np.stack([tokens_np[i + 1 : i + block_size + 1] for i in ix])
     return torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long)
 
-# -------------------------
-# Model (GPT-style)
-# -------------------------
-class CausalSelfAttention(nn.Module):
-    def __init__(self):
-        super().__init__()
-        assert EMBED_DIM % NUM_HEADS == 0
-        self.nh = NUM_HEADS
-        self.hd = EMBED_DIM // NUM_HEADS
 
-        self.qkv = nn.Linear(EMBED_DIM, 3 * EMBED_DIM, bias=False)
-        self.proj = nn.Linear(EMBED_DIM, EMBED_DIM, bias=False)
-        self.drop = nn.Dropout(DROPOUT)
+def lr_cosine_with_warmup(step, warmup_steps, total_steps, base_lr, min_lr_ratio=0.1):
+    if step < warmup_steps:
+        return base_lr * step / warmup_steps
+    progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+    return min_lr_ratio * base_lr + 0.5 * (1 + math.cos(math.pi * progress)) * (base_lr - min_lr_ratio * base_lr)
 
-        self.register_buffer(
-            "mask",
-            torch.tril(torch.ones(BLOCK_SIZE, BLOCK_SIZE)).view(1, 1, BLOCK_SIZE, BLOCK_SIZE)
+
+def main():
+    ap = argparse.ArgumentParser(description="Train causal transformer (GPTMini)")
+    ap.add_argument("--max-steps", type=int, default=25000, help="Training steps (more = lower perplexity)")
+    ap.add_argument("--batch-size", type=int, default=16, help="Larger = more stable, lower perplexity")
+    ap.add_argument("--block-size", type=int, default=256)
+    ap.add_argument("--embed-dim", type=int, default=192)
+    ap.add_argument("--num-heads", type=int, default=6, help="Must divide embed-dim")
+    ap.add_argument("--num-layers", type=int, default=4, help="More layers = lower perplexity, slower")
+    ap.add_argument("--dropout", type=float, default=0.1)
+    ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--weight-decay", type=float, default=0.1, help="AdamW weight decay (reduces overfitting)")
+    ap.add_argument("--warmup-steps", type=int, default=1000, help="LR warmup steps then cosine decay")
+    ap.add_argument("--max-train-tokens", type=int, default=None, help="Cap train tokens (default: use all). Use 0 for no limit.")
+    ap.add_argument("--grad-accum", type=int, default=1, help="Gradient accumulation steps (effective batch = batch_size * grad_accum)")
+    ap.add_argument("--out-dir", type=pathlib.Path, default=OUT_DIR, help="Checkpoint directory")
+    ap.add_argument("--resume", action="store_true", help="Resume from out-dir/ckpt.pt if present")
+    ap.add_argument("--train-bin", default=TRAIN_BIN)
+    ap.add_argument("--valid-bin", default=VALID_BIN)
+    ap.add_argument("--tok-path", default=TOK_PATH)
+    args = ap.parse_args()
+    if args.max_train_tokens == 0:
+        args.max_train_tokens = None
+
+    cfg = get_default_config()
+    cfg["BATCH_SIZE"] = args.batch_size
+    cfg["BLOCK_SIZE"] = args.block_size
+    cfg["EMBED_DIM"] = args.embed_dim
+    cfg["NUM_HEADS"] = args.num_heads
+    cfg["NUM_LAYERS"] = args.num_layers
+    cfg["DROPOUT"] = args.dropout
+
+    assert cfg["EMBED_DIM"] % cfg["NUM_HEADS"] == 0, "embed-dim must be divisible by num-heads"
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print("Device:", device)
+
+    # Data
+    train_tokens = load_tokens(args.train_bin)
+    valid_tokens = load_tokens(args.valid_bin)
+    if args.max_train_tokens is not None and len(train_tokens) > args.max_train_tokens:
+        train_tokens = train_tokens[: args.max_train_tokens]
+        print(f"(Capped to {args.max_train_tokens:,} train tokens)")
+
+    tokenizer = Tokenizer.from_file(args.tok_path)
+    cfg["VOCAB_SIZE"] = tokenizer.get_vocab_size()
+
+    print("Train tokens:", len(train_tokens))
+    print("Valid tokens:", len(valid_tokens))
+    print("Vocab size:", cfg["VOCAB_SIZE"])
+    print("Config:", {k: v for k, v in cfg.items()})
+
+    # Model & optimizer
+    model = GPTMini.from_config(cfg, dropout_inference=cfg["DROPOUT"]).to(device)
+    opt = torch.optim.AdamW(
+        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+    )
+
+    start_step = 1
+    best_val_loss = float("inf")
+
+    if args.resume and (args.out_dir / "ckpt.pt").is_file():
+        ckpt = torch.load(args.out_dir / "ckpt.pt", map_location=device)
+        model.load_state_dict(ckpt["state_dict"])
+        if "optimizer_state" in ckpt:
+            opt.load_state_dict(ckpt["optimizer_state"])
+        start_step = ckpt.get("step", 1) + 1
+        best_val_loss = ckpt.get("best_val_loss", float("inf"))
+        print(f"Resumed from step {start_step}, best_val_loss {best_val_loss:.4f}")
+
+    def estimate_val():
+        model.eval()
+        losses = []
+        with torch.no_grad():
+            for _ in range(EVAL_BATCHES):
+                xb, yb = get_batch(
+                    valid_tokens, cfg["BLOCK_SIZE"], cfg["BATCH_SIZE"]
+                )
+                xb, yb = xb.to(device), yb.to(device)
+                _, loss = model(xb, yb)
+                losses.append(loss.item())
+        model.train()
+        avg = sum(losses) / len(losses)
+        return avg, math.exp(avg)
+
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    t0 = time.time()
+
+    grad_accum = max(1, args.grad_accum)
+    print("\nTraining...")
+    for step in range(start_step, args.max_steps + 1):
+        lr = lr_cosine_with_warmup(
+            step, args.warmup_steps, args.max_steps, args.lr
         )
+        for g in opt.param_groups:
+            g["lr"] = lr
 
-    def forward(self, x):
-        B, T, C = x.shape
-        qkv = self.qkv(x)
-        q, k, v = qkv.split(C, dim=2)
-
-        q = q.view(B, T, self.nh, self.hd).transpose(1, 2)  # (B, nh, T, hd)
-        k = k.view(B, T, self.nh, self.hd).transpose(1, 2)
-        v = v.view(B, T, self.nh, self.hd).transpose(1, 2)
-
-        att = (q @ k.transpose(-2, -1)) / math.sqrt(self.hd)  # (B, nh, T, T)
-        att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float("-inf"))
-        att = F.softmax(att, dim=-1)
-        att = self.drop(att)
-
-        out = att @ v
-        out = out.transpose(1, 2).contiguous().view(B, T, C)
-        out = self.proj(out)
-        out = self.drop(out)
-        return out
-
-class MLP(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.fc1 = nn.Linear(EMBED_DIM, 4 * EMBED_DIM)
-        self.fc2 = nn.Linear(4 * EMBED_DIM, EMBED_DIM)
-        self.drop = nn.Dropout(DROPOUT)
-
-    def forward(self, x):
-        return self.drop(self.fc2(F.gelu(self.fc1(x))))
-
-class Block(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.ln1 = nn.LayerNorm(EMBED_DIM)
-        self.attn = CausalSelfAttention()
-        self.ln2 = nn.LayerNorm(EMBED_DIM)
-        self.mlp = MLP()
-
-    def forward(self, x):
-        x = x + self.attn(self.ln1(x))
-        x = x + self.mlp(self.ln2(x))
-        return x
-
-class GPTMini(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.tok = nn.Embedding(VOCAB_SIZE, EMBED_DIM)
-        self.pos = nn.Embedding(BLOCK_SIZE, EMBED_DIM)
-        self.drop = nn.Dropout(DROPOUT)
-        self.blocks = nn.ModuleList([Block() for _ in range(NUM_LAYERS)])
-        self.ln_f = nn.LayerNorm(EMBED_DIM)
-        self.head = nn.Linear(EMBED_DIM, VOCAB_SIZE, bias=False)
-
-    def forward(self, idx, targets=None):
-        B, T = idx.shape
-        pos = torch.arange(T, device=idx.device)
-        x = self.tok(idx) + self.pos(pos)
-        x = self.drop(x)
-        for blk in self.blocks:
-            x = blk(x)
-        x = self.ln_f(x)
-        logits = self.head(x)
-
-        loss = None
-        if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, VOCAB_SIZE), targets.view(-1))
-        return logits, loss
-
-    @torch.no_grad()
-    def generate(self, idx, max_new_tokens=200, seed=42, temperature=0.9, top_k=50):
-        rng = np.random.default_rng(seed)
-        for _ in range(max_new_tokens):
-            idx_cond = idx[:, -BLOCK_SIZE:]
-            logits, _ = self(idx_cond)
-            logits = logits[:, -1, :] / max(temperature, 1e-6)
-            logits = logits.squeeze(0)
-
-            if top_k and top_k > 0:
-                v, ix = torch.topk(logits, k=top_k)
-                probs = F.softmax(v, dim=-1).cpu().numpy()
-                next_id = int(rng.choice(ix.cpu().numpy(), p=probs))
-            else:
-                probs = F.softmax(logits, dim=-1).cpu().numpy()
-                next_id = int(rng.choice(VOCAB_SIZE, p=probs))
-
-            idx = torch.cat([idx, torch.tensor([[next_id]], dtype=torch.long)], dim=1)
-        return idx
-
-# -------------------------
-# Train + Eval
-# -------------------------
-model = GPTMini().to(DEVICE)
-opt = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
-
-def estimate_val():
-    model.eval()
-    losses = []
-    with torch.no_grad():
-        for _ in range(EVAL_BATCHES):
-            xb, yb = get_batch(valid_tokens)
-            xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+        opt.zero_grad()
+        for _ in range(grad_accum):
+            xb, yb = get_batch(
+                train_tokens, cfg["BLOCK_SIZE"], cfg["BATCH_SIZE"]
+            )
+            xb, yb = xb.to(device), yb.to(device)
             _, loss = model(xb, yb)
-            losses.append(loss.item())
-    model.train()
-    avg = sum(losses) / len(losses)
-    return avg, math.exp(avg)
+            (loss / grad_accum).backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step()
 
-OUT_DIR.mkdir(parents=True, exist_ok=True)
+        if step % EVAL_EVERY == 0:
+            vloss, vppl = estimate_val()
+            dt = time.time() - t0
+            print(
+                f"step {step:5d} | lr {lr:.2e} | train_loss {loss.item():.4f} | "
+                f"val_loss {vloss:.4f} | val_ppl {vppl:.2f} | {dt:.0f}s"
+            )
+            if vloss < best_val_loss:
+                best_val_loss = vloss
+                ckpt = {
+                    "state_dict": model.state_dict(),
+                    "config": dict(cfg),
+                    "tokenizer_path": str(args.tok_path),
+                    "step": step,
+                    "best_val_loss": best_val_loss,
+                    "optimizer_state": opt.state_dict(),
+                }
+                torch.save(ckpt, args.out_dir / "ckpt_best.pt")
+                print(f"  -> saved best ckpt_best.pt (val_loss {vloss:.4f})")
 
-print("\nTraining...")
-t0 = time.time()
-for step in range(1, TRAIN_STEPS + 1):
-    xb, yb = get_batch(train_tokens)
-    xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+    # Final checkpoint (always save)
+    ckpt = {
+        "state_dict": model.state_dict(),
+        "config": dict(cfg),
+        "tokenizer_path": str(args.tok_path),
+        "step": args.max_steps,
+        "best_val_loss": best_val_loss,
+    }
+    torch.save(ckpt, args.out_dir / "ckpt.pt")
+    print("\nSaved:", args.out_dir / "ckpt.pt")
+    if (args.out_dir / "ckpt_best.pt").is_file():
+        print("Best (by val loss):", args.out_dir / "ckpt_best.pt")
 
-    _, loss = model(xb, yb)
-    opt.zero_grad()
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    opt.step()
+    # Sample (use slightly lower temperature for more coherent output)
+    print("\n--- Transformer sample ---\n")
+    model.eval()
+    bos = tokenizer.token_to_id("<bos>")
+    start_id = bos if bos is not None else 0
+    start = torch.tensor([[start_id]], dtype=torch.long, device=device)
+    out = model.generate(start, max_new_tokens=250, seed=42, temperature=0.8, top_k=40)
+    print(tokenizer.decode(out[0].tolist()))
 
-    if step % EVAL_EVERY == 0:
-        vloss, vppl = estimate_val()
-        dt = time.time() - t0
-        print(f"step {step:5d} | train_loss {loss.item():.4f} | val_loss {vloss:.4f} | val_ppl {vppl:.2f} | {dt:.0f}s")
 
-# Save checkpoint
-ckpt = {
-    "state_dict": model.state_dict(),
-    "config": {
-        "BATCH_SIZE": BATCH_SIZE,
-        "BLOCK_SIZE": BLOCK_SIZE,
-        "EMBED_DIM": EMBED_DIM,
-        "NUM_HEADS": NUM_HEADS,
-        "NUM_LAYERS": NUM_LAYERS,
-        "DROPOUT": DROPOUT,
-        "VOCAB_SIZE": VOCAB_SIZE,
-    },
-    "tokenizer_path": str(TOK_PATH),
-}
-torch.save(ckpt, OUT_DIR / "ckpt.pt")
-print("\nSaved:", OUT_DIR / "ckpt.pt")
-
-print("\n--- Transformer sample ---\n")
-bos = tokenizer.token_to_id("<bos>")
-start_id = bos if bos is not None else 0
-start = torch.tensor([[start_id]], dtype=torch.long)
-out = model.generate(start, max_new_tokens=250, seed=42, temperature=0.9, top_k=50)[0].tolist()
-print(tokenizer.decode(out))
+if __name__ == "__main__":
+    main()

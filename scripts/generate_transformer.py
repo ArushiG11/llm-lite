@@ -1,95 +1,21 @@
 import argparse
 import os
 import math
+import sys
+from pathlib import Path
+
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from tokenizers import Tokenizer
-import math
+
+# Repo root for shared model
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from model_causal import GPTMini
 
 DEVICE = "cpu"
-
-# ---- Model code must match training ----
-class CausalSelfAttention(nn.Module):
-    def __init__(self, embed_dim, num_heads, block_size, dropout):
-        super().__init__()
-        assert embed_dim % num_heads == 0
-        self.nh = num_heads
-        self.hd = embed_dim // num_heads
-        self.qkv = nn.Linear(embed_dim, 3 * embed_dim, bias=False)
-        self.proj = nn.Linear(embed_dim, embed_dim, bias=False)
-        self.drop = nn.Dropout(dropout)
-        self.register_buffer(
-            "mask",
-            torch.tril(torch.ones(block_size, block_size)).view(1, 1, block_size, block_size)
-        )
-        self.block_size = block_size
-
-    def forward(self, x):
-        B, T, C = x.shape
-        qkv = self.qkv(x)
-        q, k, v = qkv.split(C, dim=2)
-        q = q.view(B, T, self.nh, self.hd).transpose(1, 2)
-        k = k.view(B, T, self.nh, self.hd).transpose(1, 2)
-        v = v.view(B, T, self.nh, self.hd).transpose(1, 2)
-
-        att = (q @ k.transpose(-2, -1)) / math.sqrt(self.hd)
-        att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float("-inf"))
-        att = F.softmax(att, dim=-1)
-        att = self.drop(att)
-
-        out = att @ v
-        out = out.transpose(1, 2).contiguous().view(B, T, C)
-        out = self.proj(out)
-        out = self.drop(out)
-        return out
-
-class MLP(nn.Module):
-    def __init__(self, embed_dim, dropout):
-        super().__init__()
-        self.fc1 = nn.Linear(embed_dim, 4 * embed_dim)
-        self.fc2 = nn.Linear(4 * embed_dim, embed_dim)
-        self.drop = nn.Dropout(dropout)
-
-    def forward(self, x):
-        return self.drop(self.fc2(F.gelu(self.fc1(x))))
-
-class Block(nn.Module):
-    def __init__(self, embed_dim, num_heads, block_size, dropout):
-        super().__init__()
-        self.ln1 = nn.LayerNorm(embed_dim)
-        self.attn = CausalSelfAttention(embed_dim, num_heads, block_size, dropout)
-        self.ln2 = nn.LayerNorm(embed_dim)
-        self.mlp = MLP(embed_dim, dropout)
-
-    def forward(self, x):
-        x = x + self.attn(self.ln1(x))
-        x = x + self.mlp(self.ln2(x))
-        return x
-
-class GPTMini(nn.Module):
-    def __init__(self, vocab_size, embed_dim, num_heads, num_layers, block_size, dropout):
-        super().__init__()
-        self.block_size = block_size
-        self.tok = nn.Embedding(vocab_size, embed_dim)
-        self.pos = nn.Embedding(block_size, embed_dim)
-        self.drop = nn.Dropout(dropout)
-        self.blocks = nn.ModuleList([Block(embed_dim, num_heads, block_size, dropout) for _ in range(num_layers)])
-        self.ln_f = nn.LayerNorm(embed_dim)
-        self.head = nn.Linear(embed_dim, vocab_size, bias=False)
-
-    def forward(self, idx):
-        B, T = idx.shape
-        pos = torch.arange(T, device=idx.device)
-        x = self.tok(idx) + self.pos(pos)
-        x = self.drop(x)
-        for blk in self.blocks:
-            x = blk(x)
-        x = self.ln_f(x)
-        logits = self.head(x)
-        return logits
-
 @torch.no_grad()
 def sample_next(logits, rng, temperature=0.9, top_k=50, top_p=0.9, repetition_penalty=1.0, recent_ids=None):
     logits = logits / max(temperature, 1e-6)
@@ -161,14 +87,7 @@ def main():
     tok_path = ckpt.get("tokenizer_path", "tokenizer/bpe_tokenizer.json")
     tok = Tokenizer.from_file(tok_path)
 
-    model = GPTMini(
-        vocab_size=cfg["VOCAB_SIZE"],
-        embed_dim=cfg["EMBED_DIM"],
-        num_heads=cfg["NUM_HEADS"],
-        num_layers=cfg["NUM_LAYERS"],
-        block_size=cfg["BLOCK_SIZE"],
-        dropout=0.0,  # no dropout at inference
-    ).to(DEVICE)
+    model = GPTMini.from_config(cfg, dropout_inference=0.0).to(DEVICE)
     model.load_state_dict(ckpt["state_dict"])
     model.eval()
 
