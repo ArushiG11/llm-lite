@@ -1,115 +1,216 @@
 # llm-lite
 
-Build a language model from scratch: **bigram → n-gram → transformer**, on a single machine with minimal dependencies.
+A from-scratch language model pipeline: **BPE tokenizer → bigram → n-gram → GPT-style transformer**, with a FastAPI inference server and React UI.
 
-## What’s in this repo
+Built to understand every layer of how LLMs work — data preparation, tokenization, statistical models, neural architecture, inference optimization, and productionization.
 
-| Step | Model | Script | Idea |
-|------|--------|--------|------|
-| 1 | **Bigram** | `scripts/train_bigram.py` | P(next \| prev); count-based, add-α smoothing. |
-| 2 | **N-gram** | `scripts/train_ngram.py` | Configurable N (2,3,4,5,…) with interpolated backoff. See [docs/NGRAM.md](docs/NGRAM.md). |
-| 3 | **Trigram (interpolated)** | `scripts/train_trigram_interpolated.py` | Trigram + bigram + unigram with λ weights. |
-| 4 | **Transformer (causal)** | `scripts/train_transformer_causal.py` | GPT-style: causal self-attention, MLP blocks, top-k sampling. |
+---
 
-You also have: sparse bigram (`train_bigram_sparse.py`), tokenizer training, and data prep (WikiText-2, BPE, tokenize-to-bin).
+## Demo
 
-## Quick start
+![llm-lite UI](docs/ui.png)
 
-```bash
-# 1. Data + tokenizer (Flow 2: Wikipedia dump → train/valid .bin + BPE)
-python scripts/prepare_data_wiki.py
+---
 
-# 2. Train models (run from repo root)
-python scripts/train_bigram.py
-python scripts/train_ngram.py --n 4    # 4-gram with interpolation
-python scripts/train_trigram_interpolated.py
-python scripts/train_transformer_causal.py   # causal GPT-style transformer
+## Benchmark results
+
+| Model | Val loss | Val PPL | Size |
+|---|---:|---:|---:|
+| Transformer (GPT-style) | 2.35 | **10.49** | 57 MB |
+| 3-gram (interpolated) | 3.84 | 46.40 | 7 MB |
+| Bigram | 9.90 | 19,993 | 244 MB |
+
+The transformer achieves **19× lower perplexity** than the trigram and **1,900× lower** than the bigram, demonstrating how attention-based context dramatically outperforms fixed windows.
+
+---
+
+## Architecture
+
+```
+Raw text
+   │
+   ▼
+prepare_data.py          — download, clean, train/valid split
+   │
+   ▼
+BPE tokenizer (8k vocab) — byte-level, trained on train split only
+   │
+   ▼
+.bin files (uint16)      — token IDs for fast training
+   │
+   ├──▶ train_bigram.py            — count table, add-α smoothing
+   ├──▶ train_ngram.py --n 3       — interpolated n-gram (any N)
+   └──▶ train_transformer_causal.py — GPT: 3 layers, 6 heads, 192 dim
+              │
+              ▼
+         model_causal.py           — shared inference + Flash Attention + KV-cache
+              │
+              ▼
+         api/  (FastAPI)           — /v1/generate  /v1/stream (SSE)
+              │
+              ▼
+         ui/   (React + Vite)      — prompt UI with streaming
 ```
 
-### Lower perplexity & better generation
+---
 
-To get **lower validation perplexity** and **more coherent samples**:
+## Setup
 
-1. **Train longer and on full data** (defaults are tuned for this now):
-   ```bash
-   python scripts/train_transformer_causal.py
-   ```
-   Defaults: 25k steps, batch 16, 4 layers, weight decay 0.1, warmup 1k steps, **all training tokens** (no cap). Use `--max-train-tokens 5000000` to cap data for a quicker run.
+```bash
+git clone <repo>
+cd llm-lite
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+pip install -r api/requirements.txt
+```
 
-2. **Optional: bigger model** (if you have GPU/memory):
-   ```bash
-   python scripts/train_transformer_causal.py --embed-dim 256 --num-layers 6 --batch-size 32 --max-steps 30000
-   ```
-
-3. **Resume** if training was interrupted:
-   ```bash
-   python scripts/train_transformer_causal.py --resume
-   ```
-
-4. **Generation quality**: The API uses **ckpt_best.pt** (best validation loss) when present. For less random, more coherent text use **lower temperature** (e.g. 0.7–0.8), **top_k 30–50**, and **repetition_penalty 1.1–1.2** in the UI or API.
-
-5. **Check perplexity** after training:
-   ```bash
-   python scripts/evaluate_models.py
-   ```
-
-Generated artifacts: `data/processed/*.bin`, `tokenizer/bpe_tokenizer.json`, `models/*.npy`, `models/*.pkl`.
-
-## Data preparation (splitting and tokenizing)
-
-Two options; both produce `data/processed/train.bin`, `valid.bin`, and `tokenizer/bpe_tokenizer.json`:
-
-- **Flow 1 — WikiText-2:** `python scripts/prepare_data.py`
-- **Flow 2 — Wikipedia dump (one script):**  
-  `pip install -r requirements.txt` then `python scripts/prepare_data_wiki.py`  
-  (Use the same venv so steps 4–5 see `tokenizers` and `numpy`.)  
-  See **[docs/DATA_PREP_FLOW.md](docs/DATA_PREP_FLOW.md)** for details.
+---
 
 ## Pipeline
 
-1. **Data**: Either Flow 1 or Flow 2 → `data/processed/train.txt`, `valid.txt`.
-2. **Tokenizer**: BPE (e.g. 8k vocab) on `train.txt` only → `tokenizer/bpe_tokenizer.json`.
-3. **Tokenize to binary**: Encode train and valid → `train.bin`, `valid.bin` (uint16 token IDs).
-4. **Train**: bigram → n-gram → transformer (see table above).
+### 1. Prepare data
 
-## What could we do better?
+```bash
+python scripts/prepare_data.py
+```
 
-- **More context**: N-grams are limited to a fixed window; transformers give long-range context with attention.
-- **Causal LM**: This repo’s transformer is **causal** (GPT-style), which matches autoregressive generation and the API.
-- **Scaling**: Larger `BLOCK_SIZE`, more layers/heads, more data, LR schedule (cosine, warmup).
-- **Training**: Checkpointing, validation-based early stopping, gradient clipping.
-- **Sampling**: You already have top-k; add top-p (nucleus), temperature tuning, repetition penalty.
-- **Tokenization**: Larger BPE vocab, sentencepiece, or train on your target domain.
-- **Architecture**: Try a small **RNN/LSTM** as a middle step between n-grams and transformers; then **attention variants** (e.g. grouped-query, RoPE).
-- **Evaluation**: Track perplexity and a few fixed prompts; add a simple downstream task (e.g. next-sentence or classification) if you want.
+Downloads WikiText-2, trains a BPE tokenizer (8k vocab), and writes `data/processed/train.bin` and `valid.bin`.
 
-See `ROADMAP.md` for a concrete ordered list of next steps.
+### 2. Train models
+
+```bash
+# Statistical baselines
+python scripts/train_bigram.py
+python scripts/train_ngram.py --n 3
+
+# GPT-style causal transformer
+python scripts/train_transformer_causal.py
+```
+
+Resume a stopped run: `python scripts/train_transformer_causal.py --resume`
+
+### 3. Compare all three
+
+```bash
+python scripts/compare_models.py
+```
+
+### 4. Generate text (no server)
+
+```bash
+python scripts/generate_transformer.py --prompt "The history of" --max_new_tokens 150
+```
 
 ---
 
-## Phase 2: Backend (Inference API)
+## API
 
-Run the trained transformer as a **service** so a user or UI can call it.
+```bash
+uvicorn api.app.main:app --host 127.0.0.1 --port 8000
+```
 
-- **API:** FastAPI app in `api/app/` — load checkpoint, expose `POST /v1/generate` and `POST /v1/stream`.
-- **Run:** From repo root, `uvicorn api.app.main:app --port 8000` (after training and `pip install -r api/requirements.txt`).
-- **Docs:** See **[api/README.md](api/README.md)** for prerequisites, env vars, endpoints, and example `curl` calls.
+| Endpoint | Description |
+|---|---|
+| `GET /healthz` | Model load status |
+| `POST /v1/generate` | Full response (blocking) |
+| `POST /v1/stream` | Token-by-token SSE stream |
+| `GET /docs` | Interactive Swagger UI |
+
+```bash
+# One-shot
+curl -s -X POST http://127.0.0.1:8000/v1/generate \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "The history of", "max_new_tokens": 100}' | python3 -m json.tool
+
+# Streaming
+curl -N -X POST http://127.0.0.1:8000/v1/stream \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "The history of", "max_new_tokens": 100}'
+```
+
+**Generation parameters:**
+
+| Field | Default | Description |
+|---|---|---|
+| `prompt` | required | Input text |
+| `max_new_tokens` | 200 | Tokens to generate |
+| `temperature` | 0.9 | Randomness (lower = more focused) |
+| `top_k` | 50 | Sample from top-k tokens only |
+| `top_p` | 1.0 | Nucleus sampling cutoff |
+| `repetition_penalty` | 1.0 | Penalize repeated tokens |
+| `seed` | 42 | Reproducibility |
 
 ---
 
-## Phase 3: UI
+## UI
 
-A **React + TypeScript** web UI (Vite) to prompt the model and stream or one-shot generate.
+```bash
+cd ui && npm install && npm run dev
+```
 
-- **Stack:** React 18, TypeScript, Vite. Lives in `ui/`.
-- **Dev:** From repo root, run the API on port 8000, then in another terminal:
-  ```bash
-  cd ui && npm install && npm run dev
-  ```
-  Open the URL Vite prints (e.g. http://localhost:5173); the dev server proxies `/healthz` and `/v1/*` to the API.
-- **Production:** Build and serve from the API:
-  ```bash
-  cd ui && npm install && npm run build
-  ```
-  Then start the API and open **http://127.0.0.1:8000/ui**.
-- **Features:** Prompt box, “Stream response” toggle, Generate button, optional generation settings (max tokens, temperature, top-k, top-p, repetition penalty), Copy output, and a status indicator for model loaded.
+Open [http://localhost:5173](http://localhost:5173). The Vite dev server proxies `/healthz` and `/v1/*` to the API on port 8000.
+
+**Features:** prompt box · stream toggle · generation settings · live streaming cursor · copy button · model status indicator
+
+---
+
+## Docker
+
+```bash
+docker compose up --build
+```
+
+Serves the UI at [http://localhost:80](http://localhost:80). nginx proxies API traffic so no Vite dev server is needed in production.
+
+---
+
+## Optimizations implemented
+
+| Technique | Where | Effect |
+|---|---|---|
+| **Flash Attention** | `model_causal.py` | Fused CUDA kernel, O(√T) memory vs O(T²) |
+| **KV-cache** | `model_causal.py` | O(1) per decode step vs O(T) without cache |
+| **float16 inference** | `model_loader.py` | Halves VRAM on GPU/MPS |
+| **Async thread pool** | `api/app/api/routes.py` | Event loop never blocked during inference |
+| **CORS middleware** | `api/app/main.py` | Cross-origin UI support |
+| **Rate limiting** | `api/app/main.py` | Per-IP request throttling via slowapi |
+| **SSE streaming** | API + UI | Tokens appear in real time |
+| **Top-p + rep. penalty** | `model_causal.py` | Nucleus sampling, avoids repetition |
+
+---
+
+## Project structure
+
+```
+llm-lite/
+├── model_causal.py              # GPTMini: Flash Attention, KV-cache, sampling
+├── requirements.txt
+├── scripts/
+│   ├── prepare_data.py          # Data download + BPE tokenizer training
+│   ├── train_bigram.py
+│   ├── train_ngram.py
+│   ├── train_transformer_causal.py
+│   ├── generate_transformer.py
+│   ├── evaluate_models.py
+│   └── compare_models.py
+├── api/
+│   ├── app/
+│   │   ├── main.py              # FastAPI app, CORS, rate limiting
+│   │   ├── api/routes.py        # /generate, /stream, /healthz
+│   │   ├── api/schemas.py       # Pydantic request/response models
+│   │   ├── core/config.py       # pydantic-settings (env vars)
+│   │   └── services/
+│   │       ├── inference_service.py
+│   │       ├── model_loader.py
+│   │       └── tokenizer_service.py
+│   ├── requirements.txt
+│   └── Dockerfile
+├── ui/
+│   ├── src/
+│   │   ├── App.tsx              # Main component
+│   │   └── api/client.ts        # fetch + SSE client
+│   ├── Dockerfile
+│   └── nginx.conf               # Proxies /v1 and /healthz to API
+├── docker-compose.yml
+└── tokenizer/bpe_tokenizer.json
+```
