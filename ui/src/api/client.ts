@@ -51,7 +51,9 @@ export async function streamGenerate(
       if (line.startsWith("data: ")) {
         const payload = line.slice(6).trim();
         if (payload === "[DONE]") return;
-        onChunk(payload);
+        // The server JSON-encodes each chunk so newlines inside tokens
+        // don't break the SSE \n\n frame delimiter.
+        onChunk(JSON.parse(payload) as string);
       }
     }
   }

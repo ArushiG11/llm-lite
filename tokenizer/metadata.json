@@ -1,0 +1,14 @@
+{
+  "tokenizer_file": "tokenizer/bpe_tokenizer.json",
+  "model_type": "BPE",
+  "vocab_size": 8000,
+  "special_tokens": [
+    "<pad>",
+    "<unk>",
+    "<bos>",
+    "<eos>"
+  ],
+  "min_frequency": 2,
+  "dataset": "roneneldan/TinyStories",
+  "train_file": "data/processed/train.txt"
+}

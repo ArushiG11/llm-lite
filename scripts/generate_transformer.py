@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from tokenizers import Tokenizer
+from tokenizers.decoders import ByteLevel as ByteLevelDecoder
 
 # Repo root for shared model
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -58,7 +59,7 @@ def generate(model, start_ids, max_new_tokens, seed, temperature, top_k, top_p, 
     ids = start_ids[:]
     for _ in range(max_new_tokens):
         x = torch.tensor([ids[-model.block_size:]], dtype=torch.long, device=DEVICE)
-        logits = model(x)[0, -1, :]
+        logits = model(x)[0][0, -1, :]
         recent = ids[-repeat_window:] if repeat_window > 0 else []
         nxt = sample_next(logits, rng, temperature, top_k, top_p, repetition_penalty, recent_ids=recent)
         ids.append(nxt)
@@ -86,6 +87,7 @@ def main():
     cfg = ckpt["config"]
     tok_path = ckpt.get("tokenizer_path", "tokenizer/bpe_tokenizer.json")
     tok = Tokenizer.from_file(tok_path)
+    tok.decoder = ByteLevelDecoder()
 
     model = GPTMini.from_config(cfg, dropout_inference=0.0).to(DEVICE)
     model.load_state_dict(ckpt["state_dict"])

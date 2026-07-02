@@ -1,154 +1,109 @@
-import os
-from pathlib import Path
+"""
+FastAPI entrypoint: loads config and inference services once at startup.
+"""
 
-from fastapi import FastAPI, HTTPException
+from __future__ import annotations
+
+import traceback
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 
-from .schemas import GenerateRequest, GenerateResponse
-from .model import InferenceEngine
-
-def _default_ckpt():
-    base = Path(os.getenv("LLMLITE_CKPT", "models/transformer/ckpt.pt"))
-    if not os.getenv("LLMLITE_CKPT"):
-        best = base.parent / "ckpt_best.pt"
-        if best.is_file():
-            return str(best)
-    return str(base)
+from .api.routes import router
+from .core.config import get_settings
+from .core.limiter import limiter
+from .services.inference_service import InferenceService
 
 
-CKPT_PATH = _default_ckpt()
-UI_DIST = Path(__file__).resolve().parent.parent.parent / "ui" / "dist"
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    settings = get_settings()
+    app.state.settings = settings
+    app.state.inference = InferenceService(settings)
+    if app.state.inference.is_ready:
+        print(f"Inference ready (checkpoint: {settings.resolved_checkpoint_path()})")
+    else:
+        print(f"Inference not ready: {app.state.inference.load_error}")
+    yield
+
 
 app = FastAPI(
-    title="llm-lite API",
-    description="Inference API for the trained causal transformer. Use /v1/generate or /v1/stream.",
-    version="1.0.0",
+    title="llm-lite inference API",
+    description="Synchronous + streaming inference over a trained GPTMini checkpoint and BPE tokenizer.",
+    version="2.0.0",
+    lifespan=lifespan,
 )
 
+# Rate limiter state (slowapi reads from app.state.limiter).
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# CORS: allow the Vite dev server and any production origin.
+# In production, replace "*" with your actual domain.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
+    allow_origins=["http://localhost:5173", "http://localhost:3000", "http://localhost:80"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
-engine: InferenceEngine | None = None
+# All inference routes live under /v1 — matches the Vite proxy config and client.ts.
+app.include_router(router, prefix="/v1")
 
 
-def _ensure_engine():
-    if engine is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Model not loaded. Check that the checkpoint exists and the server started correctly.",
-        )
-
-
-@app.on_event("startup")
-def _load_model():
-    global engine
-    ckpt = Path(CKPT_PATH)
-    if not ckpt.is_file():
-        print(f"Warning: Checkpoint not found at {CKPT_PATH}. Train first: python scripts/train_transformer_causal.py")
-        return
-    try:
-        engine = InferenceEngine(CKPT_PATH)
-        print(f"Loaded model from {CKPT_PATH}")
-    except Exception as e:
-        print(f"Failed to load model: {e}")
-        engine = None
-
-
-@app.get("/", tags=["root"])
-def root():
-    """Root: links to docs, health, and UI."""
-    return {
-        "message": "llm-lite API",
-        "docs": "/docs",
-        "health": "/healthz",
-        "ui": "/ui",
-        "generate": "POST /v1/generate",
-        "stream": "POST /v1/stream",
-    }
-
-
-@app.get("/ui", tags=["ui"])
-@app.get("/ui/", tags=["ui"])
-def serve_ui():
-    """Serve the llm-lite web UI (Phase 3 — React app)."""
-    index = UI_DIST / "index.html"
-    if not index.is_file():
-        raise HTTPException(
-            status_code=404,
-            detail="UI not built. Run: cd ui && npm install && npm run build",
-        )
-    return FileResponse(index)
-
-
+# /healthz is separate from /v1 so the UI can poll it before the model is
+# confirmed ready without needing an auth or version prefix.
 @app.get("/healthz", tags=["health"])
-def healthz():
-    """Health check. Use for readiness probes."""
-    return {
-        "ok": engine is not None,
-        "ckpt": CKPT_PATH,
-        "model_loaded": engine is not None,
-    }
+async def healthz(request: Request):
+    """Combined liveness + readiness check for the UI.
+
+    Returns { ok, model_loaded, ckpt } so the frontend can show a status badge
+    without making two separate calls (/health + /ready).
+    """
+    svc = getattr(request.app.state, "inference", None)
+    model_loaded = svc is not None and svc.is_ready
+    ckpt = str(svc._loaded.checkpoint_path) if model_loaded and svc._loaded else ""
+    return {"ok": True, "ckpt": ckpt, "model_loaded": model_loaded}
 
 
-@app.post("/v1/generate", response_model=GenerateResponse, tags=["generate"])
-def generate(req: GenerateRequest):
-    """Generate text in one shot. Returns full prompt + completion."""
-    _ensure_engine()
-    prompt_ids = engine.encode(req.prompt)
-
-    if len(prompt_ids) > 4096:
-        prompt_ids = prompt_ids[-4096:]
-
-    out_ids = engine.generate_ids(
-        prompt_ids=prompt_ids,
-        max_new_tokens=req.max_new_tokens,
-        temperature=req.temperature,
-        top_k=req.top_k,
-        top_p=req.top_p,
-        repetition_penalty=req.repetition_penalty,
-        repeat_window=req.repeat_window,
-        seed=req.seed,
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(_request: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=422,
+        content={
+            "error": "Validation error",
+            "code": "validation_error",
+            "detail": exc.errors(),
+        },
     )
-    return GenerateResponse(text=engine.decode(out_ids))
 
 
-@app.post("/v1/stream", tags=["generate"])
-def stream(req: GenerateRequest):
-    """Stream generated tokens as Server-Sent Events (SSE). One data event per token."""
-    _ensure_engine()
-    prompt_ids = engine.encode(req.prompt)
-
-    if len(prompt_ids) > 4096:
-        prompt_ids = prompt_ids[-4096:]
-
-    def event_stream():
-        ids = prompt_ids[:]
-        for _ in range(req.max_new_tokens):
-            new_ids = engine.generate_ids(
-                prompt_ids=ids,
-                max_new_tokens=1,
-                temperature=req.temperature,
-                top_k=req.top_k,
-                top_p=req.top_p,
-                repetition_penalty=req.repetition_penalty,
-                repeat_window=req.repeat_window,
-                seed=req.seed,
-            )
-            next_id = new_ids[-1]
-            ids.append(next_id)
-            chunk = engine.decode([next_id])
-            yield f"data: {chunk}\n\n"
-        yield "data: [DONE]\n\n"
-
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+@app.exception_handler(HTTPException)
+async def http_exception_handler(_request: Request, exc: HTTPException):
+    """Return JSON bodies for HTTPException (including FastAPI defaults)."""
+    if isinstance(exc.detail, dict):
+        body = exc.detail
+    else:
+        body = {"error": str(exc.detail), "code": "http_error"}
+    return JSONResponse(status_code=exc.status_code, content=body)
 
 
-if UI_DIST.is_dir():
-    app.mount("/ui", StaticFiles(directory=str(UI_DIST), html=True), name="ui")
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(_request: Request, exc: Exception):
+    """Avoid raw tracebacks in responses; log server-side."""
+    if isinstance(exc, (RequestValidationError, HTTPException)):
+        raise exc
+    traceback.print_exc()
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "Internal server error",
+            "code": "internal_error",
+            "reason": str(exc),
+        },
+    )

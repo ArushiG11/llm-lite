@@ -9,8 +9,7 @@ Build a language model from scratch: **bigram → n-gram → transformer**, on a
 | 1 | **Bigram** | `scripts/train_bigram.py` | P(next \| prev); count-based, add-α smoothing. |
 | 2 | **N-gram** | `scripts/train_ngram.py` | Configurable N (2,3,4,5,…) with interpolated backoff. See [docs/NGRAM.md](docs/NGRAM.md). |
 | 3 | **Trigram (interpolated)** | `scripts/train_trigram_interpolated.py` | Trigram + bigram + unigram with λ weights. |
-| 4 | **Transformer (encoder)** | `scripts/train_transformer.py` | PyTorch `TransformerEncoder` (bidirectional). |
-| 5 | **Transformer (causal)** | `scripts/train_transformer_causal.py` | GPT-style: causal self-attention, MLP blocks, top-k sampling. |
+| 4 | **Transformer (causal)** | `scripts/train_transformer_causal.py` | GPT-style: causal self-attention, MLP blocks, top-k sampling. |
 
 You also have: sparse bigram (`train_bigram_sparse.py`), tokenizer training, and data prep (WikiText-2, BPE, tokenize-to-bin).
 
@@ -24,8 +23,7 @@ python scripts/prepare_data_wiki.py
 python scripts/train_bigram.py
 python scripts/train_ngram.py --n 4    # 4-gram with interpolation
 python scripts/train_trigram_interpolated.py
-python scripts/train_transformer.py     # small encoder (CPU-friendly)
-python scripts/train_transformer_causal.py   # causal GPT-style
+python scripts/train_transformer_causal.py   # causal GPT-style transformer
 ```
 
 ### Lower perplexity & better generation
@@ -77,7 +75,7 @@ Two options; both produce `data/processed/train.bin`, `valid.bin`, and `tokenize
 ## What could we do better?
 
 - **More context**: N-grams are limited to a fixed window; transformers give long-range context with attention.
-- **Causal vs bidirectional**: For autoregressive text generation use the **causal** transformer; the encoder script is for understanding the API / bidirectional setups.
+- **Causal LM**: This repo’s transformer is **causal** (GPT-style), which matches autoregressive generation and the API.
 - **Scaling**: Larger `BLOCK_SIZE`, more layers/heads, more data, LR schedule (cosine, warmup).
 - **Training**: Checkpointing, validation-based early stopping, gradient clipping.
 - **Sampling**: You already have top-k; add top-p (nucleus), temperature tuning, repetition penalty.

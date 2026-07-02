@@ -1,227 +1,226 @@
 """
-Generic N-gram language model with interpolated backoff.
+Train an N-gram language model with linear interpolation.
+
+Interpolation blends N orders together so that a zero high-order count
+never produces zero probability — lower-order models act as a safety net.
+
+  P(next | ctx) = λ_N·P_N(next|full_ctx) + ... + λ_1·P_1(next)
 
 Usage:
-  python scripts/train_ngram.py --n 3   # trigram (same idea as train_trigram_interpolated)
-  python scripts/train_ngram.py --n 4   # 4-gram
-  python scripts/train_ngram.py --n 5   # 5-gram (needs more data)
-
-Trains counts for 1-gram, 2-gram, ... N-gram and combines them with learned
-interpolation weights (lambdas). Smoothing is add-alpha at each level.
+  python scripts/train_ngram.py          # trigram (N=3) by default
+  python scripts/train_ngram.py --n 4
+  python scripts/train_ngram.py --n 2   # same as bigram but with interpolation
 """
 
 import argparse
 import math
 import pathlib
 import pickle
-import time
-from collections import Counter
 from collections import defaultdict
 
 import numpy as np
 from tokenizers import Tokenizer
+from tokenizers.decoders import ByteLevel as ByteLevelDecoder
+
+TRAIN_BIN = pathlib.Path("data/processed/train.bin")
+VALID_BIN = pathlib.Path("data/processed/valid.bin")
+TOK_PATH  = pathlib.Path("tokenizer/bpe_tokenizer.json")
+OUT_DIR   = pathlib.Path("models")
+
+DEFAULT_N      = 3
+DEFAULT_ALPHA  = 0.001   # small alpha: adds only alpha*vocab pseudo-counts per context
+SAMPLE_TOKENS  = 200
+SEED           = 42
 
 
-def load_tokens(bin_path: str, dtype=np.uint16) -> np.ndarray:
-    return np.fromfile(bin_path, dtype=dtype)
+# ── data ───────────────────────────────────────────────────────────────────────
+
+def load_tokens(path: pathlib.Path) -> list[int]:
+    """Read flat uint16 binary into a Python list of ints."""
+    return np.fromfile(path, dtype=np.uint16).astype(np.int32).tolist()
 
 
-def build_ngram_counts(tokens: np.ndarray, n: int):
+# ── model ──────────────────────────────────────────────────────────────────────
+
+def build_ngram_counts(tokens: list[int], n: int) -> tuple[list[dict], list[dict]]:
     """
-    Build counts for 1-gram, 2-gram, ... n-gram.
+    Build count dicts for all orders from 1 up to n.
+
     Returns:
-      counts[k] = Counter for (k+1)-gram: counts[k][tuple of (k+1) tokens] = count
-      ctx[k] = Counter for context of (k+1)-gram: ctx[k][tuple of k tokens] = count
-      total = len(tokens)
+      ngram_counts  — list of dicts, index k holds k+1-gram counts
+                       ngram_counts[0][()]         = {next: count}  ← unigram
+                       ngram_counts[1][(w1,)]      = {next: count}  ← bigram
+                       ngram_counts[2][(w1,w2)]    = {next: count}  ← trigram
+      ctx_totals    — total tokens seen after each context
+                       ctx_totals[1][(w1,)] = sum of ngram_counts[1][(w1,)].values()
+
+    Using dicts (sparse) instead of dense arrays because for N≥3 most possible
+    n-grams never appear in training — a dense array would be mostly zeros.
     """
-    counts = [Counter() for _ in range(n)]   # counts[0]=unigram, counts[1]=bigram, ...
-    ctx = [Counter() for _ in range(n)]     # ctx[0] not used; ctx[1]=unigram ctx for bigram, ...
+    # defaultdict of defaultdict(int) for each order
+    ngram_counts: list[dict] = [defaultdict(lambda: defaultdict(int)) for _ in range(n)]
+    ctx_totals:   list[dict] = [defaultdict(int) for _ in range(n)]
 
-    # Unigram
-    for x in tokens:
-        counts[0][int(x)] += 1
-    total = len(tokens)
+    for i in range(len(tokens) - n + 1):
+        next_tok = tokens[i + n - 1]
+        for k in range(n):
+            # context is the k tokens immediately before next_tok
+            ctx = tuple(tokens[i + (n - 1 - k) : i + (n - 1)])  # length k
+            ngram_counts[k][ctx][next_tok] += 1
+            ctx_totals[k][ctx] += 1
 
-    # Bigram through n-gram
-    for k in range(1, n):
-        # (k+1)-gram: (t_0, ..., t_k) where we predict t_k given (t_0,...,t_{k-1})
-        for i in range(len(tokens) - k):
-            key = tuple(int(tokens[i + j]) for j in range(k + 1))
-            context_key = key[:-1]
-            counts[k][key] += 1
-            ctx[k][context_key] += 1
-
-    return counts, ctx, total
+    return ngram_counts, ctx_totals
 
 
-def prob_k(counts: list, ctx: list, total: int, context: tuple, w: int, V: int, alpha: float, k: int) -> float:
+def prob_kth_order(next_tok: int, ctx: tuple, ngram_counts: list[dict],
+                   ctx_totals: list[dict], vocab_size: int, alpha: float) -> float:
     """
-    P(w | context) for (k+1)-gram level.
-    context has length k: (prev_k, ..., prev_1) so we predict w after context.
-    For k=0 (unigram): context is empty, P(w) = (count(w)+alpha)/(total+alpha*V).
+    P_k(next | ctx) with add-α smoothing for the k-th order model.
+    ctx has length k (k=0 for unigram, k=1 for bigram, etc.)
     """
-    if k == 0:
-        return (counts[0][w] + alpha) / (total + alpha * V)
-    denom = ctx[k][context] + alpha * V
-    key = context + (w,)
-    return (counts[k][key] + alpha) / denom
+    k          = len(ctx)
+    # Use .get(ctx, {}) because defaultdict factories aren't preserved by pickle.
+    count_next = ngram_counts[k].get(ctx, {}).get(next_tok, 0)
+    count_ctx  = ctx_totals[k].get(ctx, 0)
+    return (count_next + alpha) / (count_ctx + alpha * vocab_size)
 
 
-def p_interp(counts, ctx, total, context_tuple, w, V, alpha, lambdas):
+def interpolated_prob(next_tok: int, context: tuple, lambdas: list[float],
+                      ngram_counts: list[dict], ctx_totals: list[dict],
+                      vocab_size: int, alpha: float) -> float:
     """
-    context_tuple = (prev_n_minus_1, ..., prev_1) of length n-1 for n-gram model.
-    We have n levels: unigram (context length 0), bigram (1), ..., n-gram (n-1).
+    Blend all orders using interpolation weights (lambdas).
+
+    context is the full N-1 length history.  For each order k, we take
+    only the last k tokens as the context (suffix of the full context).
     """
-    n = len(lambdas)
     p = 0.0
+    n = len(lambdas)  # number of orders
     for k in range(n):
-        ctx_k = context_tuple[-(k):] if k > 0 else ()   # last k tokens for k+1-gram
-        p += lambdas[k] * prob_k(counts, ctx, total, ctx_k, w, V, alpha, k)
+        ctx_k = context[max(0, len(context) - k):]  # last k tokens
+        p += lambdas[k] * prob_kth_order(next_tok, ctx_k, ngram_counts,
+                                          ctx_totals, vocab_size, alpha)
     return p
 
 
-def perplexity(valid_tokens: np.ndarray, counts, ctx, total, n: int, V: int, alpha: float, lambdas) -> tuple[float, float]:
-    nll = 0.0
-    N = 0
-    for i in range(n - 1, len(valid_tokens)):
-        w = int(valid_tokens[i])
-        context = tuple(int(valid_tokens[i - j]) for j in range(n - 1, 0, -1))  # (t_{i-n+1}, ..., t_{i-1})
-        p = p_interp(counts, ctx, total, context, w, V, alpha, lambdas)
-        p = max(p, 1e-12)
-        nll += -math.log(p)
-        N += 1
-    avg_nll = nll / max(N, 1)
-    return math.exp(avg_nll), avg_nll
+def compute_perplexity(tokens: list[int], lambdas: list[float],
+                       ngram_counts: list[dict], ctx_totals: list[dict],
+                       vocab_size: int, alpha: float, n: int) -> float:
+    """
+    Evaluate perplexity over a token sequence using the interpolated model.
+    """
+    log_prob_sum = 0.0
+    count        = 0
+
+    for i in range(n - 1, len(tokens)):
+        next_tok = tokens[i]
+        context  = tuple(tokens[max(0, i - (n - 1)) : i])  # up to N-1 tokens
+        p        = interpolated_prob(next_tok, context, lambdas, ngram_counts,
+                                     ctx_totals, vocab_size, alpha)
+        log_prob_sum += math.log(max(p, 1e-300))  # guard against log(0)
+        count += 1
+
+    return math.exp(-log_prob_sum / count)
 
 
-def build_followers(counts: Counter, n: int):
-    """For n-gram Counter, map context (n-1 tokens) -> list of (follower, count)."""
-    followers = defaultdict(list)  # context -> [(w, count), ...]
-    for key, cnt in counts[n - 1].items():
-        ctx = key[:-1]
-        w = key[-1]
-        followers[ctx].append((w, cnt))
-    return dict(followers)
+# ── generation ─────────────────────────────────────────────────────────────────
 
+def generate(lambdas: list[float], ngram_counts: list[dict], ctx_totals: list[dict],
+             vocab_size: int, alpha: float, n: int,
+             start_id: int, max_tokens: int, seed: int) -> list[int]:
+    """
+    Autoregressively sample using the interpolated N-gram model.
 
-def sample_next(context_tuple, followers, counts, ctx, total, V, alpha, lambdas, rng: np.random.Generator) -> int:
-    """Sample next token given context (length n-1). Fallback to lower-order when context unseen."""
-    n = len(lambdas)
-    # Try highest-order context first
-    if context_tuple in followers:
-        cands, cnts = zip(*followers[context_tuple])
-        cnts = np.array(cnts, dtype=np.float64) + alpha
-        cnts /= cnts.sum()
-        return int(rng.choice(list(cands), p=cnts))
-    # Fallback: sample from interpolated distribution over full vocab (expensive) or top unigrams
-    # Cheap fallback: sample from unigram
-    top = [w for w, _ in counts[0].most_common(min(2000, len(counts[0])))]
-    if not top:
-        return int(rng.integers(0, V))
-    probs = np.array([p_interp(counts, ctx, total, context_tuple, w, V, alpha, lambdas) for w in top], dtype=np.float64)
-    probs /= probs.sum()
-    return int(rng.choice(top, p=probs))
-
-
-def generate(tokenizer: Tokenizer, counts, ctx, total, followers, V: int, n: int, alpha: float, lambdas,
-             max_tokens: int = 250, seed: int = 42):
+    At each step we compute the full vocabulary distribution, then sample.
+    This is O(vocab_size) per step — fine for vocab_size=8000.
+    """
     rng = np.random.default_rng(seed)
-    bos_id = tokenizer.token_to_id("<bos>")
-    eos_id = tokenizer.token_to_id("<eos>")
+    ids = [start_id]
 
-    if bos_id is None:
-        start = [int(rng.integers(0, V)) for _ in range(n - 1)]
-    else:
-        start = [int(bos_id)] * (n - 1)
+    for _ in range(max_tokens):
+        context = tuple(ids[-(n - 1):])  # last N-1 tokens as context
+        probs   = np.array([
+            interpolated_prob(w, context, lambdas, ngram_counts, ctx_totals, vocab_size, alpha)
+            for w in range(vocab_size)
+        ], dtype=np.float64)
+        probs  /= probs.sum()  # renormalise (smoothing can make them not sum exactly to 1)
+        ids.append(int(rng.choice(vocab_size, p=probs)))
 
-    out = list(start)
-    for _ in range(max_tokens - (n - 1)):
-        context = tuple(out[-(n - 1):])
-        nxt = sample_next(context, followers, counts, ctx, total, V, alpha, lambdas, rng)
-        out.append(nxt)
-        if eos_id is not None and nxt == eos_id:
-            break
-    return tokenizer.decode(out)
+    return ids
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Train interpolated N-gram LM")
-    parser.add_argument("--n", type=int, default=4, help="N-gram order (e.g. 4 for 4-gram)")
-    parser.add_argument("--alpha", type=float, default=0.1, help="Add-alpha smoothing")
-    parser.add_argument("--max-tokens", type=int, default=5_000_000, help="Cap training tokens (0 = use all). Default 0 for fair comparison with bigram.")
-    parser.add_argument("--train-bin", type=str, default="data/processed/train.bin")
-    parser.add_argument("--valid-bin", type=str, default="data/processed/valid.bin")
-    parser.add_argument("--tokenizer", type=str, default="tokenizer/bpe_tokenizer.json")
-    parser.add_argument("--out-dir", type=str, default="models")
-    args = parser.parse_args()
+# ── main ───────────────────────────────────────────────────────────────────────
 
-    n = max(2, args.n)
-    alpha = args.alpha
-    max_tokens = args.max_tokens
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Train an interpolated N-gram model")
+    ap.add_argument("--n", type=int, default=DEFAULT_N,
+                    help="N-gram order (2=bigram, 3=trigram, etc.)")
+    ap.add_argument("--alpha", type=float, default=DEFAULT_ALPHA,
+                    help="Add-α smoothing strength (default: 0.001)")
+    ap.add_argument("--sample-tokens", type=int, default=SAMPLE_TOKENS)
+    args = ap.parse_args()
 
-    train_bin = args.train_bin
-    valid_bin = args.valid_bin
-    tok_path = args.tokenizer
+    assert args.n >= 2, "N must be at least 2 (bigram)"
 
-    start_time = time.time()
+    tok         = Tokenizer.from_file(str(TOK_PATH))
+    tok.decoder = ByteLevelDecoder()  # converts Ġ → space in tok.decode()
+    vocab_size  = tok.get_vocab_size()
+    bos_id      = tok.token_to_id("<bos>") or 0
+    print(f"Order       : {args.n}-gram")
+    print(f"Vocab size  : {vocab_size}")
 
-    print("Loading tokenizer...")
-    tokenizer = Tokenizer.from_file(tok_path)
-    V = tokenizer.get_vocab_size()
-    print(f"Vocab size: {V:,}")
+    print("Loading tokens ...")
+    train_tokens = load_tokens(TRAIN_BIN)
+    valid_tokens = load_tokens(VALID_BIN)
+    print(f"Train : {len(train_tokens):,} | Valid : {len(valid_tokens):,}")
 
-    print("Loading tokens...")
-    train_tokens = load_tokens(train_bin)
-    valid_tokens = load_tokens(valid_bin)
-    print(f"Train tokens: {len(train_tokens):,}")
-    print(f"Valid tokens: {len(valid_tokens):,}")
+    print(f"\nBuilding {args.n}-gram counts ...")
+    # Use a subset for faster training; increase for better models
+    ngram_counts, ctx_totals = build_ngram_counts(train_tokens[:2_000_000], args.n)
+    for k in range(args.n):
+        print(f"  order {k+1}: {len(ngram_counts[k]):,} unique contexts")
 
-    if max_tokens > 0 and len(train_tokens) > max_tokens:
-        train_tokens = train_tokens[:max_tokens]
-        print(f"Capped to first {max_tokens:,} train tokens")
+    # Interpolation weights: proportional to total observations at each order.
+    # Higher-order models have sparser counts, so we weight them by how much
+    # data they actually saw — contexts with more total counts get more weight.
+    # This is better than a fixed exponential scheme when data is limited.
+    raw = [sum(ctx_totals[k].values()) for k in range(args.n)]
+    total   = sum(raw)
+    lambdas = [r / total for r in raw]
+    print(f"\nInterpolation weights: {[f'{l:.3f}' for l in lambdas]}")
+    print(f"  (index 0 = unigram, index {args.n-1} = {args.n}-gram)")
 
-    print(f"\nBuilding {n}-gram counts...")
-    t0 = time.time()
-    counts, ctx, total = build_ngram_counts(train_tokens, n)
-    print(f"Counts built in {time.time() - t0:.2f}s")
-    for k in range(n):
-        print(f"  Level {k+1}-gram unique: {len(counts[k]):,}")
+    # Evaluate on a sample (full valid set, capped train sample for speed)
+    print("\nEvaluating ...")
+    eval_train = train_tokens[:50_000]
+    train_ppl  = compute_perplexity(eval_train, lambdas, ngram_counts, ctx_totals,
+                                    vocab_size, args.alpha, args.n)
+    valid_ppl  = compute_perplexity(valid_tokens[:20_000], lambdas, ngram_counts,
+                                    ctx_totals, vocab_size, args.alpha, args.n)
+    print(f"Train perplexity : {train_ppl:>8.2f}")
+    print(f"Valid perplexity : {valid_ppl:>8.2f}")
+    print(f"(Random baseline : {vocab_size})")
 
-    # Default lambdas: more weight on higher order (sum = 1)
-    lambdas = np.ones(n) / n
-    # Slight bias toward higher n-gram
-    for k in range(n):
-        lambdas[k] = (k + 1) / ((n * (n + 1)) / 2)
-    lambdas = tuple(lambdas.tolist())
-    print(f"Lambdas: {lambdas}")
-
-    print("\nEvaluating perplexity...")
-    ppl, avg_nll = perplexity(valid_tokens, counts, ctx, total, n, V, alpha, lambdas)
-    print(f"Valid avg NLL: {avg_nll:.4f}")
-    print(f"Valid perplexity: {ppl:.2f}")
-
-    out_dir = pathlib.Path(args.out_dir)
-    out_dir.mkdir(exist_ok=True)
-    model_path = out_dir / f"ngram_n{n}_interpolated.pkl"
-    followers = build_followers(counts, n)
+    # Save model for evaluate_models.py
+    OUT_DIR.mkdir(exist_ok=True)
+    model_path = OUT_DIR / f"ngram_n{args.n}.pkl"
     with open(model_path, "wb") as f:
         pickle.dump({
-            "n": n,
-            "counts": counts,
-            "ctx": ctx,
-            "total": total,
-            "V": V,
-            "alpha": alpha,
+            "n": args.n,
             "lambdas": lambdas,
-            "followers": followers,
+            "alpha": args.alpha,
+            "vocab_size": vocab_size,
+            "ngram_counts": [{k: dict(v) for k, v in d.items()} for d in ngram_counts],
+            "ctx_totals": [dict(d) for d in ctx_totals],
         }, f)
-    print(f"\nSaved: {model_path}")
+    print(f"\nSaved → {model_path}")
 
-    print("\n--- N-gram sample ---\n")
-    text = generate(tokenizer, counts, ctx, total, followers, V, n, alpha, lambdas, max_tokens=250, seed=42)
+    # Generate a sample
+    print(f"\n--- {args.n}-gram sample ---\n")
+    ids  = generate(lambdas, ngram_counts, ctx_totals, vocab_size, args.alpha,
+                    args.n, bos_id, args.sample_tokens, SEED)
+    text = tok.decode(ids)
     print(text)
-
-    print(f"\n=== Total time: {time.time() - start_time:.2f}s ===")
 
 
 if __name__ == "__main__":

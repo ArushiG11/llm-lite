@@ -82,7 +82,12 @@ def main():
 
     assert cfg["EMBED_DIM"] % cfg["NUM_HEADS"] == 0, "embed-dim must be divisible by num-heads"
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif torch.backends.mps.is_available():
+        device = "mps"   # Apple Silicon GPU
+    else:
+        device = "cpu"
     print("Device:", device)
 
     # Data
@@ -92,7 +97,9 @@ def main():
         train_tokens = train_tokens[: args.max_train_tokens]
         print(f"(Capped to {args.max_train_tokens:,} train tokens)")
 
+    from tokenizers.decoders import ByteLevel as ByteLevelDecoder
     tokenizer = Tokenizer.from_file(args.tok_path)
+    tokenizer.decoder = ByteLevelDecoder()
     cfg["VOCAB_SIZE"] = tokenizer.get_vocab_size()
 
     print("Train tokens:", len(train_tokens))
@@ -102,9 +109,15 @@ def main():
 
     # Model & optimizer
     model = GPTMini.from_config(cfg, dropout_inference=cfg["DROPOUT"]).to(device)
+    if device == "cuda":
+        model = torch.compile(model)  # ~30% speedup; CUDA only (MPS inductor not stable)
     opt = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
+    # AMP: use float16 on CUDA, bfloat16 on MPS, disabled on CPU
+    amp_dtype = torch.float16 if device == "cuda" else torch.bfloat16
+    use_amp   = device in ("cuda", "mps")
+    scaler    = torch.amp.GradScaler(enabled=(device == "cuda"))  # scaler only for float16
 
     start_step = 1
     best_val_loss = float("inf")
@@ -146,21 +159,26 @@ def main():
             g["lr"] = lr
 
         opt.zero_grad()
+        train_loss = 0.0
         for _ in range(grad_accum):
             xb, yb = get_batch(
                 train_tokens, cfg["BLOCK_SIZE"], cfg["BATCH_SIZE"]
             )
             xb, yb = xb.to(device), yb.to(device)
-            _, loss = model(xb, yb)
-            (loss / grad_accum).backward()
+            with torch.amp.autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
+                _, loss = model(xb, yb)
+            scaler.scale(loss / grad_accum).backward()
+            train_loss += loss.item() / grad_accum
+        scaler.unscale_(opt)  # unscale before clipping so norms are in real units
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
+        scaler.step(opt)
+        scaler.update()
 
         if step % EVAL_EVERY == 0:
             vloss, vppl = estimate_val()
             dt = time.time() - t0
             print(
-                f"step {step:5d} | lr {lr:.2e} | train_loss {loss.item():.4f} | "
+                f"step {step:5d} | lr {lr:.2e} | train_loss {train_loss:.4f} | "
                 f"val_loss {vloss:.4f} | val_ppl {vppl:.2f} | {dt:.0f}s"
             )
             if vloss < best_val_loss:
@@ -193,9 +211,11 @@ def main():
     print("\n--- Transformer sample ---\n")
     model.eval()
     bos = tokenizer.token_to_id("<bos>")
+    eos = tokenizer.token_to_id("<eos>")
     start_id = bos if bos is not None else 0
     start = torch.tensor([[start_id]], dtype=torch.long, device=device)
-    out = model.generate(start, max_new_tokens=250, seed=42, temperature=0.8, top_k=40)
+    out = model.generate(start, max_new_tokens=250, seed=42, temperature=0.8, top_k=40,
+                         eos_id=eos)
     print(tokenizer.decode(out[0].tolist()))
 
 

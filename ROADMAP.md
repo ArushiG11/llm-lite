@@ -7,7 +7,6 @@ Ordered ideas to go from “working” to “better” without changing the core
 - [x] Bigram (count-based, smoothed)
 - [x] Trigram with interpolation
 - [x] Generic N-gram (any N, interpolated)
-- [x] Transformer (encoder, for learning)
 - [x] Causal transformer (GPT-style, for generation)
 - [x] BPE tokenizer, WikiText-2, tokenize-to-bin pipeline
 

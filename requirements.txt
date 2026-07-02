@@ -1,10 +1,6 @@
-# Flow 2: Wikipedia dump pipeline (prepare_data_wiki.py) + tokenizer steps
 # Install: pip install -r requirements.txt
-mwxml
-mwparserfromhell
-tqdm
+datasets
 tokenizers
 numpy
-
-# Optional: for scripts/evaluate_models.py graphs
+tqdm
 matplotlib
